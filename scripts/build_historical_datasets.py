@@ -177,6 +177,19 @@ def fresh_label(row):
     return 'flat'
 
 
+WSOL_MINT = 'So11111111111111111111111111111111111111112'
+USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
+
+def fresh_quote_mint(c, final, gtfa):
+    return gtfa.get('quote_mint') or c.get('quote_mint') or c.get('quoteMint') or final.get('quote_mint') or WSOL_MINT
+
+def fresh_quote_symbol(quote_mint):
+    if quote_mint == USDC_MINT:
+        return 'USDC'
+    if quote_mint == WSOL_MINT or not quote_mint:
+        return 'WSOL'
+    return 'UNSUPPORTED'
+
 def normalize_fresh_row(mint, c, snapshots, gtfa):
     ss = sorted(snapshots, key=lambda r: inum(r.get('age_secs')))
     final = ss[-1] if ss else {}
@@ -194,9 +207,15 @@ def normalize_fresh_row(mint, c, snapshots, gtfa):
     max_buyers = max([inum(gtfa.get('unique_buyers_60s'))] + [inum(s.get('unique_buyers')) for s in ss] + [0])
     max_net_flow = max([fnum(gtfa.get('net_flow_sol_60s'))] + [fnum(s.get('net_flow_sol')) for s in ss] + [0.0])
     trade_stream_missing = bool(gtfa.get('trade_stream_missing')) if gtfa else all(inum(s.get('buy_count')) + inum(s.get('sell_count')) == 0 for s in ss)
+    quote_mint = fresh_quote_mint(c, final, gtfa)
+    quote_symbol = fresh_quote_symbol(quote_mint)
     row = {
         'dataset': 'fresh_launch',
+        'fresh_pair': f'fresh_{quote_symbol}',
         'mint': mint,
+        'quote_mint': quote_mint,
+        'quote_symbol': quote_symbol,
+        'quote_decimals': 6 if quote_symbol == 'USDC' else 9,
         'name': c.get('name') or final.get('name', '') or gtfa.get('name', ''),
         'symbol': c.get('symbol') or final.get('symbol', '') or gtfa.get('symbol', ''),
         'creator': c.get('traderPublicKey') or final.get('creator', '') or gtfa.get('creator', ''),
@@ -244,6 +263,8 @@ def build_fresh(candidates, snapshots, v2_snapshots, gtfa_rows, moonshot_pct_min
 def write_report(path, migration_clean, migration_winners, quote_spike_suspects, variant_rows, fresh_rows, fresh_winners, fresh_rugs, args):
     path.parent.mkdir(parents=True, exist_ok=True)
     no_trade = sum(1 for r in fresh_rows if r.get('trade_stream_missing'))
+    fresh_wsol = sum(1 for r in fresh_rows if r.get('quote_symbol') == 'WSOL')
+    fresh_usdc = sum(1 for r in fresh_rows if r.get('quote_symbol') == 'USDC')
     gtfa_migration = sum(1 for r in migration_winners if r.get('gtfa_enriched'))
     usdc = sum(1 for r in migration_clean if r.get('quote_symbol') == 'USDC')
     with path.open('w') as f:
@@ -295,7 +316,7 @@ def main():
     fresh_rows, fresh_winners, fresh_rugs = build_fresh(cand_rows, snap_rows, v2_snap_rows, fresh_gtfa, args.fresh_moonshot_pct_min)
 
     migration_fields = ['dataset','mint','best_variant','best_net_pnl_pct','best_net_pnl_sol','best_mfe_pct','paper_mfe_pct','gtfa_mfe_pct','best_hold_secs','best_exit_reason','quote_symbol','source','pool_state','base_mint','quote_mint','pool_base_token_account','pool_quote_token_account','creator_address','entry_quote_reserve_raw','min_quote_reserve_raw','max_drawdown_pct','advanced_gate_passed','advanced_gate_reason','variant_count','quote_spike_suspect','gtfa_enriched']
-    fresh_fields = ['dataset','mint','name','symbol','creator','entry_market_cap_sol','max_market_cap_sol','final_market_cap_sol','max_change_pct','final_change_pct','max_buy_count','max_sell_count','max_unique_buyers','max_net_flow_sol','final_exit_label','last_age_secs','create_sol_amount','create_market_cap_sol','trade_stream_missing','gtfa_enriched']
+    fresh_fields = ['dataset','fresh_pair','mint','quote_mint','quote_symbol','quote_decimals','name','symbol','creator','entry_market_cap_sol','max_market_cap_sol','final_market_cap_sol','max_change_pct','final_change_pct','max_buy_count','max_sell_count','max_unique_buyers','max_net_flow_sol','final_exit_label','last_age_secs','create_sol_amount','create_market_cap_sol','trade_stream_missing','gtfa_enriched']
     variant_fields = ['variant_id','n','wr_pct','avg_pnl_pct','median_pnl_pct','total_sol','avg_mfe_pct']
 
     write_csv(out / 'migration_all_mint_summary.csv', migration_summary, migration_fields)

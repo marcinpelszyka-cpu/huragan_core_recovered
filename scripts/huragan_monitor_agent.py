@@ -144,8 +144,12 @@ def load_fresh_metrics(dataset_dir, root):
     for r in fresh_summary:
         if (r.get("label") == "no_trade_data") or str(r.get("trade_stream_missing", "")).lower() == "true":
             no_trade += 1
+    wsol = sum(1 for r in fresh_summary if r.get("quote_symbol") == "WSOL")
+    usdc = sum(1 for r in fresh_summary if r.get("quote_symbol") == "USDC")
     return {
         "tracked_mints": len(fresh_summary),
+        "wsol_tracked_mints": wsol,
+        "usdc_tracked_mints": usdc,
         "no_trade_data": no_trade,
         "no_trade_data_pct": round(pct(no_trade, len(fresh_summary)), 4),
         "v2_candidates": v2_candidates,
@@ -234,7 +238,8 @@ def format_report(snapshot, previous, decision_doc, deltas, alerts):
     lines.append("")
     lines.append("## Fresh")
     lines.append(
-        f"tracked={fresh.get('tracked_mints',0)}, no_trade_data={fresh.get('no_trade_data_pct',0):.1f}%, "
+        f"tracked={fresh.get('tracked_mints',0)}, WSOL={fresh.get('wsol_tracked_mints',0)}, "
+        f"USDC={fresh.get('usdc_tracked_mints',0)}, no_trade_data={fresh.get('no_trade_data_pct',0):.1f}%, "
         f"v2_candidates={fresh.get('v2_candidates',0)}, v2_snapshots={fresh.get('v2_snapshots',0)}"
     )
     lines.append("")

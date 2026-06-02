@@ -6,12 +6,61 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+fn infer_quote_mint(v: &Value) -> String {
+    v.get("quoteMint")
+        .or_else(|| v.get("quote_mint"))
+        .or_else(|| v.get("quoteAssetMint"))
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(WSOL_MINT)
+        .to_string()
+}
+
+fn quote_symbol(mint: &str) -> &'static str {
+    match mint {
+        USDC_MINT => "USDC",
+        WSOL_MINT | "" => "WSOL",
+        _ => "UNSUPPORTED",
+    }
+}
+
+fn quote_decimals(mint: &str) -> u8 {
+    match mint {
+        USDC_MINT => 6,
+        _ => 9,
+    }
+}
+
+fn enrich_quote_fields(v: &mut Value, quote_mint: &str, quote_symbol: &str, quote_decimals: u8) {
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("quote_mint".into(), Value::String(quote_mint.to_string()));
+        obj.insert(
+            "quote_symbol".into(),
+            Value::String(quote_symbol.to_string()),
+        );
+        obj.insert(
+            "quote_decimals".into(),
+            Value::Number(quote_decimals.into()),
+        );
+        obj.insert(
+            "fresh_pair".into(),
+            Value::String(format!("fresh_{quote_symbol}")),
+        );
+    }
+}
+
 #[derive(Debug)]
 struct TrackedFreshToken {
     mint: String,
     name: String,
     symbol: String,
     creator: String,
+    quote_mint: String,
+    quote_symbol: String,
+    quote_decimals: u8,
     created_at: Instant,
     entry_market_cap_sol: f64,
     current_market_cap_sol: f64,
@@ -73,6 +122,9 @@ impl TrackedFreshToken {
             "name": self.name,
             "symbol": self.symbol,
             "creator": self.creator,
+            "quote_mint": self.quote_mint,
+            "quote_symbol": self.quote_symbol,
+            "quote_decimals": self.quote_decimals,
             "entry_market_cap_sol": self.entry_market_cap_sol,
             "current_market_cap_sol": self.current_market_cap_sol,
             "max_market_cap_sol": self.max_market_cap_sol,
@@ -188,6 +240,9 @@ async fn handle_event(
             .and_then(|x| x.as_f64())
             .unwrap_or(0.0);
         let fee = v.get("solAmount").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let quote_mint = infer_quote_mint(v);
+        let quote_symbol = quote_symbol(&quote_mint);
+        let quote_decimals = quote_decimals(&quote_mint);
         if mc >= min_mc && fee >= min_fee && fee <= max_fee {
             if active.len() >= max_active {
                 let skipped = json!({"mint":mint,"exit_label":"skipped_capacity","label":"skipped_capacity","captured_at_utc":chrono::Utc::now().to_rfc3339()});
@@ -195,8 +250,10 @@ async fn handle_event(
                 append_jsonl("fresh_lifecycle_v2_snapshots.jsonl", &skipped)?;
                 return Ok(());
             }
-            append_jsonl("fresh_momentum_candidates.jsonl", v)?;
-            append_jsonl("fresh_lifecycle_v2_candidates.jsonl", v)?;
+            let mut candidate = v.clone();
+            enrich_quote_fields(&mut candidate, &quote_mint, quote_symbol, quote_decimals);
+            append_jsonl("fresh_momentum_candidates.jsonl", &candidate)?;
+            append_jsonl("fresh_lifecycle_v2_candidates.jsonl", &candidate)?;
             active.insert(
                 mint.clone(),
                 TrackedFreshToken {
@@ -212,6 +269,9 @@ async fn handle_event(
                         .and_then(|x| x.as_str())
                         .unwrap_or("")
                         .into(),
+                    quote_mint: quote_mint.clone(),
+                    quote_symbol: quote_symbol.into(),
+                    quote_decimals,
                     created_at: Instant::now(),
                     entry_market_cap_sol: mc,
                     current_market_cap_sol: mc,
@@ -245,6 +305,12 @@ async fn handle_event(
         t.max_market_cap_sol = t.max_market_cap_sol.max(mc);
         t.min_market_cap_sol = t.min_market_cap_sol.min(mc);
         let sol = v.get("solAmount").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let quote_mint = infer_quote_mint(v);
+        if t.quote_mint.is_empty() || t.quote_mint == WSOL_MINT {
+            t.quote_mint = quote_mint.clone();
+            t.quote_symbol = quote_symbol(&quote_mint).into();
+            t.quote_decimals = quote_decimals(&quote_mint);
+        }
         let wallet = v
             .get("traderPublicKey")
             .and_then(|x| x.as_str())
@@ -305,6 +371,27 @@ async fn flush_snapshots(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_mint_defaults_to_wsol_for_legacy_events() {
+        let v = json!({"txType":"create","mint":"M"});
+        assert_eq!(infer_quote_mint(&v), WSOL_MINT);
+        assert_eq!(quote_symbol(&infer_quote_mint(&v)), "WSOL");
+        assert_eq!(quote_decimals(&infer_quote_mint(&v)), 9);
+    }
+
+    #[test]
+    fn quote_mint_detects_usdc_events() {
+        let v = json!({"quote_mint":USDC_MINT});
+        assert_eq!(infer_quote_mint(&v), USDC_MINT);
+        assert_eq!(quote_symbol(&infer_quote_mint(&v)), "USDC");
+        assert_eq!(quote_decimals(&infer_quote_mint(&v)), 6);
+    }
 }
 
 fn env_f64(key: &str, default: f64) -> f64 {

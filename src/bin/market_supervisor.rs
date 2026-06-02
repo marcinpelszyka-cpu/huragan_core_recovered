@@ -80,6 +80,8 @@ struct MigrationDatasetMetrics {
 #[derive(Debug, Default, Serialize)]
 struct FreshDatasetMetrics {
     tracked_mints: usize,
+    wsol_tracked_mints: usize,
+    usdc_tracked_mints: usize,
     moonshot_winners: usize,
     rug_cases: usize,
     no_trade_data_count: usize,
@@ -534,6 +536,14 @@ fn read_fresh_dataset_metrics(dir: &str) -> FreshDatasetMetrics {
         .count();
     FreshDatasetMetrics {
         tracked_mints: rows.len(),
+        wsol_tracked_mints: rows
+            .iter()
+            .filter(|r| r.get("quote_symbol").map(String::as_str) == Some("WSOL"))
+            .count(),
+        usdc_tracked_mints: rows
+            .iter()
+            .filter(|r| r.get("quote_symbol").map(String::as_str) == Some("USDC"))
+            .count(),
         moonshot_winners: winners.len(),
         rug_cases: rugs.len(),
         no_trade_data_count: no_trade,
