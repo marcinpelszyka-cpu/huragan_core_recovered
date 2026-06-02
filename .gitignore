@@ -2,11 +2,14 @@
 *.log
 *.jsonl
 target/
+datasets/
+.vscode/
+__pycache__/
+*.pyc
 orphan_tokens.json
 agents_decision.json
 fresh_lifecycle_snapshots.jsonl
 fresh_momentum_candidates.jsonl
 fresh_raw_events.jsonl
-
-__pycache__/
-*.pyc
+helius_unparsed_transactions.jsonl
+helius_buy_samples.jsonl
