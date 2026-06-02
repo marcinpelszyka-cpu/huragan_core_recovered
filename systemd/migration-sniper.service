@@ -15,5 +15,10 @@ ExecStart=/opt/huragan_core/target/release/huragan_core
 Restart=on-failure
 RestartSec=5
 
+# hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+
 [Install]
 WantedBy=multi-user.target

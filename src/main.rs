@@ -50,9 +50,16 @@ async fn main() -> anyhow::Result<()> {
     let rpc = RpcClient::new(rpc_url.clone());
     let mut trades_seen = 0u64;
 
-    // Load wallet key for live mode
+    // Load wallet key only when explicitly allowed. Plaintext private keys in .env are
+    // unsafe after a server-side key leak; paper/shadow modes must never require one.
     let live_send = env_bool("LIVE_SEND_ENABLED", false);
-    let payer: Option<Keypair> = if !paper_mode {
+    let allow_plaintext_key = env_bool("ALLOW_PLAINTEXT_PRIVATE_KEY", false);
+    if (live_send || live_armed) && !allow_plaintext_key {
+        anyhow::bail!(
+            "live mode blocked: set ALLOW_PLAINTEXT_PRIVATE_KEY=true only after rotating wallet and accepting server key risk"
+        );
+    }
+    let payer: Option<Keypair> = if !paper_mode && allow_plaintext_key {
         let key_bs58 = env::var("SOLANA_PRIVATE_KEY_BASE58")
             .map_err(|_| anyhow::anyhow!("SOLANA_PRIVATE_KEY_BASE58 required for live mode"))?;
         let bytes = bs58::decode(&key_bs58).into_vec()?;

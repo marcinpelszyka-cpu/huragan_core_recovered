@@ -7,3 +7,8 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=/opt/huragan_core
 ExecStart=/opt/huragan_core/scripts/huragan_monitor_agent.py --root /opt/huragan_core --window-mins 120 --dataset-dir datasets --snapshot /opt/huragan_core/monitor_agent_snapshot.json --output-json /opt/huragan_core/monitor_agent_report.json --output-md /tmp/huragan_monitor_report.md
+
+# hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
