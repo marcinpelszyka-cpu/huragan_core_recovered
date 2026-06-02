@@ -1,0 +1,9 @@
+[Unit]
+Description=Huragan Core - 2h Monitor Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/huragan_core
+ExecStart=/opt/huragan_core/scripts/huragan_monitor_agent.py --root /opt/huragan_core --window-mins 120 --dataset-dir datasets --snapshot /opt/huragan_core/monitor_agent_snapshot.json --output-json /opt/huragan_core/monitor_agent_report.json --output-md /tmp/huragan_monitor_report.md

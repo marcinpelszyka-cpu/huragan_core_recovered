@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Huragan 2h Monitor Agent
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=2h
+Unit=huragan-monitor-agent.service
+
+[Install]
+WantedBy=timers.target
