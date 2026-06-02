@@ -1,0 +1,12 @@
+.env
+*.log
+*.jsonl
+target/
+orphan_tokens.json
+agents_decision.json
+fresh_lifecycle_snapshots.jsonl
+fresh_momentum_candidates.jsonl
+fresh_raw_events.jsonl
+
+__pycache__/
+*.pyc

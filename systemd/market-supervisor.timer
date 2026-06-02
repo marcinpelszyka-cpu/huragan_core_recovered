@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Market Supervisor every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Unit=market-supervisor.service
+
+[Install]
+WantedBy=timers.target

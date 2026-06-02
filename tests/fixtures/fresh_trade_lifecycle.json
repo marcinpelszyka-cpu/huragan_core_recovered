@@ -1,0 +1,4 @@
+[
+  {"mint":"MintA","marketCapSol":20,"txType":"create","traderPublicKey":"Creator"},
+  {"mint":"MintA","age_secs":60,"current_market_cap_sol":45,"buy_count":12,"sell_count":3,"unique_buyers":10,"net_flow_sol":3.2}
+]

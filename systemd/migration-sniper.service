@@ -1,0 +1,19 @@
+[Unit]
+Description=Huragan Core - Migration Sniper Paper Lab
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/huragan_core
+Environment=RUST_LOG=info
+Environment=PAPER_MODE=true
+Environment=LIVE_ARMED=false
+Environment=AMM_LIVE_CANARY=false
+Environment=MAX_TRADES_PER_RUN=1
+ExecStart=/opt/huragan_core/target/release/huragan_core
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

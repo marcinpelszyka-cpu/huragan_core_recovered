@@ -1,0 +1,17 @@
+[Unit]
+Description=Huragan Core - Fresh Momentum Capture
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/huragan_core
+Environment=FRESH_MOMENTUM_CAPTURE=only
+Environment=PAPER_MODE=true
+Environment=LIVE_ARMED=false
+ExecStart=/opt/huragan_core/target/release/huragan_core
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

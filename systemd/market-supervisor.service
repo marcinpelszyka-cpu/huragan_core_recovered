@@ -1,0 +1,7 @@
+[Unit]
+Description=Huragan Core - Market Supervisor
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/huragan_core
+ExecStart=/opt/huragan_core/target/release/market_supervisor --state /opt/huragan_core/state.jsonl --live-state /opt/huragan_core/state.jsonl --window-mins 120 --output /opt/huragan_core/agents_decision.json --report /tmp/market_supervisor_report.md
