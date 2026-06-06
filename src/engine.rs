@@ -711,6 +711,35 @@ pub async fn build_sell_amm_ixs_real_preflight(
     })
 }
 
+#[allow(dead_code)]
+pub async fn live_sell_user_token_balance(
+    rpc: &RpcClient,
+    target: &MigrationTarget,
+    payer: &Keypair,
+) -> anyhow::Result<u64> {
+    if target.quote_asset() != QuoteAsset::Wsol {
+        anyhow::bail!(
+            "non-WSOL quote not supported for live sell balance: {}",
+            target.quote_asset_mint
+        );
+    }
+    let quote_mint = Pubkey::from_str(&target.quote_mint)?;
+    let base_token_program = Pubkey::from_str(SPL_TOKEN_PROGRAM)?;
+    let token_2022_program = Pubkey::from_str(SPL_TOKEN_2022_PROGRAM)?;
+    let quote_mint_account = rpc.get_account(&quote_mint).await?;
+    let quote_token_program = quote_mint_account.owner;
+    if quote_token_program != base_token_program && quote_token_program != token_2022_program {
+        anyhow::bail!(
+            "unsupported quote token program for {}: {}",
+            target.quote_mint,
+            quote_token_program
+        );
+    }
+    let user_quote_ata =
+        derive_ata_with_program(&payer.pubkey(), &quote_mint, &quote_token_program);
+    token_account_amount(rpc, &user_quote_ata).await
+}
+
 // ── Pump AMM Buy Instruction Builder v1 ──────────────────────────────────
 
 /// Pump AMM SOL→coin instruction is logged as `Sell`.

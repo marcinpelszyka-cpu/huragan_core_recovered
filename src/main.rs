@@ -18,7 +18,9 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::signature::Keypair;
 use std::env;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -69,6 +71,29 @@ async fn main() -> anyhow::Result<()> {
     };
 
     println!("🧬 huragan_core recovered boot | paper_mode={paper_mode} live_armed={live_armed} live_send={live_send} variants=F/I/Z/Z2/Z3/Z3.1");
+
+    if !paper_mode {
+        if let Some(mut open) = latest_open_live_holding(&ledger)? {
+            if !env_bool("LIVE_AUTO_SELL_ENABLED", false) {
+                anyhow::bail!(
+                    "AMM CANARY BLOCKED: open live holding {} requires LIVE_AUTO_SELL_ENABLED=true",
+                    open.mint
+                );
+            }
+            let payer_ref = payer
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("open live holding requires payer key"))?;
+            let target = target_from_live_state(&open)?;
+            let executor = executor::Executor::new(rpc_url.clone());
+            println!(
+                "🔄 LIVE AUTO-SELL RESUME: mint={} remaining_tokens={}",
+                open.mint, open.remaining_tokens
+            );
+            run_z3_live_auto_sell_monitor(&rpc, &executor, &ledger, &target, &mut open, payer_ref)
+                .await?;
+            return Ok(());
+        }
+    }
 
     while let Some(mut target) = rx.recv().await {
         if filter::static_filter(&target).is_err() {
@@ -204,6 +229,18 @@ async fn main() -> anyhow::Result<()> {
                                     target.mint, sig, plan.expected_tokens_out
                                 );
                                 println!("📝 LIVE POSITION SAVED: {} holding", target.mint);
+                                if env_bool("LIVE_AUTO_SELL_ENABLED", false) {
+                                    let mut live_state = state;
+                                    run_z3_live_auto_sell_monitor(
+                                        &rpc,
+                                        &executor,
+                                        &ledger,
+                                        &target,
+                                        &mut live_state,
+                                        payer_ref,
+                                    )
+                                    .await?;
+                                }
                             }
                             Err(e) => {
                                 let reason = sanitize_live_error(&e.to_string());
@@ -299,6 +336,17 @@ fn validate_live_start(paper_mode: bool, live_armed: bool) -> anyhow::Result<()>
     if env_f64("BUY_AMOUNT_SOL", 0.003) > 0.003 {
         anyhow::bail!("AMM CANARY BLOCKED: BUY_AMOUNT_SOL must be <= 0.003");
     }
+    if env::var("LIVE_VARIANT").unwrap_or_else(|_| "Z".into()) != "Z3" {
+        anyhow::bail!("AMM CANARY BLOCKED: LIVE_VARIANT must be Z3");
+    }
+    if env_bool("LIVE_SEND_ENABLED", false) {
+        if !env_bool("LIVE_AUTO_SELL_ENABLED", false) {
+            anyhow::bail!("AMM CANARY BLOCKED: LIVE_AUTO_SELL_ENABLED must be true for live send");
+        }
+        if !env_bool("LIVE_SELL_SEND_ENABLED", false) {
+            anyhow::bail!("AMM CANARY BLOCKED: LIVE_SELL_SEND_ENABLED must be true for live send");
+        }
+    }
     Ok(())
 }
 
@@ -362,6 +410,380 @@ fn sanitize_live_error(error: &str) -> String {
         .collect::<Vec<_>>()
         .join("_");
     compact.chars().take(180).collect()
+}
+
+async fn run_z3_live_auto_sell_monitor(
+    rpc: &RpcClient,
+    executor: &executor::Executor,
+    ledger: &LedgerManager,
+    target: &MigrationTarget,
+    state: &mut PositionState,
+    payer: &Keypair,
+) -> anyhow::Result<()> {
+    if state.variant_id != "Z3" {
+        anyhow::bail!("live auto-sell only supports Z3, got {}", state.variant_id);
+    }
+    if target.quote_asset() != QuoteAsset::Wsol {
+        anyhow::bail!(
+            "live auto-sell only supports WSOL quote, got {}",
+            target.quote_asset().symbol()
+        );
+    }
+    let interval_ms = env_u64("LIVE_SELL_CHECK_INTERVAL_MS", 1000);
+    let max_hold_secs = 300u64;
+    let started = Instant::now();
+    let mut highest = 1.0f64;
+    let mut lowest = 1.0f64;
+    let mut last_value_sol = state.cost_basis_sol;
+
+    println!(
+        "👀 LIVE AUTO-SELL MONITOR START: mint={} cost_basis_sol={:.9}",
+        state.mint, state.cost_basis_sol
+    );
+
+    loop {
+        let age = started.elapsed().as_secs();
+        let token_balance = match engine::live_sell_user_token_balance(rpc, target, payer).await {
+            Ok(balance) => balance,
+            Err(e) => {
+                if age >= max_hold_secs {
+                    return execute_live_sell(
+                        rpc,
+                        executor,
+                        ledger,
+                        target,
+                        state,
+                        payer,
+                        "price_unavailable",
+                        age,
+                        last_value_sol,
+                        highest,
+                        lowest,
+                        Some(format!("token_balance_unavailable:{e}")),
+                    )
+                    .await;
+                }
+                sleep(Duration::from_millis(interval_ms)).await;
+                continue;
+            }
+        };
+        state.remaining_tokens = token_balance;
+        if token_balance == 0 {
+            state.status = "completed".into();
+            state.exit_reason = "token_balance_zero".into();
+            state.live_exit_reason = "token_balance_zero".into();
+            state.hold_secs = age;
+            state.remaining_tokens = 0;
+            ledger.save_new_position(state)?;
+            println!(
+                "✅ LIVE SELL CONFIRMED: {} | already_empty=true",
+                state.mint
+            );
+            return Ok(());
+        }
+
+        let current_value_sol = match engine::quote_sell_amm(rpc, target, token_balance).await {
+            Ok(lamports) if lamports > 0 => lamports as f64 / 1e9,
+            Ok(_) | Err(_) => {
+                if age >= max_hold_secs {
+                    return execute_live_sell(
+                        rpc,
+                        executor,
+                        ledger,
+                        target,
+                        state,
+                        payer,
+                        "price_unavailable",
+                        age,
+                        last_value_sol,
+                        highest,
+                        lowest,
+                        None,
+                    )
+                    .await;
+                }
+                sleep(Duration::from_millis(interval_ms)).await;
+                continue;
+            }
+        };
+        last_value_sol = current_value_sol;
+        let ratio = if state.cost_basis_sol > 0.0 {
+            current_value_sol / state.cost_basis_sol
+        } else {
+            0.0
+        };
+        highest = highest.max(ratio);
+        lowest = lowest.min(ratio);
+        let max_favorable_pct = (highest - 1.0) * 100.0;
+
+        if let Some(reason) = z3_live_exit_reason(age, ratio, max_favorable_pct) {
+            return execute_live_sell(
+                rpc,
+                executor,
+                ledger,
+                target,
+                state,
+                payer,
+                reason,
+                age,
+                current_value_sol,
+                highest,
+                lowest,
+                None,
+            )
+            .await;
+        }
+
+        sleep(Duration::from_millis(interval_ms)).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_live_sell(
+    rpc: &RpcClient,
+    executor: &executor::Executor,
+    ledger: &LedgerManager,
+    target: &MigrationTarget,
+    state: &mut PositionState,
+    payer: &Keypair,
+    reason: &str,
+    age: u64,
+    current_value_sol: f64,
+    highest: f64,
+    lowest: f64,
+    preknown_error: Option<String>,
+) -> anyhow::Result<()> {
+    let token_balance = match engine::live_sell_user_token_balance(rpc, target, payer).await {
+        Ok(balance) => balance,
+        Err(e) => {
+            let detail = preknown_error.unwrap_or_else(|| format!("token_balance_unavailable:{e}"));
+            return save_live_sell_failed(
+                ledger,
+                state,
+                reason,
+                age,
+                current_value_sol,
+                highest,
+                lowest,
+                "",
+                &detail,
+            );
+        }
+    };
+    if token_balance == 0 {
+        state.status = "completed".into();
+        state.remaining_tokens = 0;
+        state.exit_reason = reason.into();
+        state.live_exit_reason = reason.into();
+        state.hold_secs = age;
+        ledger.save_new_position(state)?;
+        println!(
+            "✅ LIVE SELL CONFIRMED: {} | already_empty=true",
+            state.mint
+        );
+        return Ok(());
+    }
+
+    let mut sell =
+        match engine::build_sell_amm_ixs_real_preflight(rpc, target, token_balance, payer).await {
+            Ok(plan) => plan,
+            Err(e) => {
+                return save_live_sell_failed(
+                    ledger,
+                    state,
+                    reason,
+                    age,
+                    current_value_sol,
+                    highest,
+                    lowest,
+                    "",
+                    &format!("build_sell_failed:{e}"),
+                );
+            }
+        };
+    state.live_sell_family = sell.instruction_family.clone();
+    if let Err(e) = sell.simulate_preflight(rpc, payer).await {
+        return save_live_sell_failed(
+            ledger,
+            state,
+            reason,
+            age,
+            current_value_sol,
+            highest,
+            lowest,
+            "",
+            &format!("sell_preflight_failed:{e}"),
+        );
+    }
+    if !env_bool("LIVE_SELL_SEND_ENABLED", false) {
+        println!(
+            "🛡️ LIVE SELL PREFLIGHT: {} | reason={} send=SEND_DISABLED",
+            state.mint, reason
+        );
+        return Ok(());
+    }
+
+    match executor
+        .send_with_preflight(payer, &sell.instructions)
+        .await
+    {
+        Ok(sig) => {
+            println!(
+                "🚀 LIVE SELL SUBMITTED: {} | sig={} reason={} tokens={}",
+                state.mint, sig, reason, token_balance
+            );
+            match executor.wait_confirmed(&sig, 10).await {
+                Ok(()) => {
+                    state.status = "completed".into();
+                    state.remaining_tokens = 0;
+                    state.sell_signature = sig.to_string();
+                    state.live_exit_sol = sell.expected_sol_out as f64 / 1e9;
+                    state.paper_exit_sol = state.live_exit_sol;
+                    state.realized_pnl_sol = state.live_exit_sol - state.cost_basis_sol;
+                    state.gross_pnl_sol = state.realized_pnl_sol;
+                    state.net_pnl_sol = state.realized_pnl_sol;
+                    state.net_pnl_pct = if state.cost_basis_sol > 0.0 {
+                        state.realized_pnl_sol / state.cost_basis_sol * 100.0
+                    } else {
+                        0.0
+                    };
+                    state.exit_reason = reason.into();
+                    state.live_exit_reason = reason.into();
+                    state.hold_secs = age;
+                    state.max_favorable_pct = (highest - 1.0) * 100.0;
+                    state.max_drawdown_pct = (lowest - 1.0) * 100.0;
+                    state.live_sell_family = sell.instruction_family.clone();
+                    ledger.save_new_position(state)?;
+                    println!(
+                        "✅ LIVE SELL CONFIRMED: {} | sig={} reason={} exit_sol={:.9}",
+                        state.mint, sig, reason, state.live_exit_sol
+                    );
+                    Ok(())
+                }
+                Err(e) => save_live_sell_failed(
+                    ledger,
+                    state,
+                    reason,
+                    age,
+                    current_value_sol,
+                    highest,
+                    lowest,
+                    &sig.to_string(),
+                    &format!("sell_confirm_failed:{e}"),
+                ),
+            }
+        }
+        Err(e) => save_live_sell_failed(
+            ledger,
+            state,
+            reason,
+            age,
+            current_value_sol,
+            highest,
+            lowest,
+            "",
+            &format!("sell_submit_failed:{e}"),
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_live_sell_failed(
+    ledger: &LedgerManager,
+    state: &mut PositionState,
+    reason: &str,
+    age: u64,
+    current_value_sol: f64,
+    highest: f64,
+    lowest: f64,
+    sell_signature: &str,
+    detail: &str,
+) -> anyhow::Result<()> {
+    let detail = sanitize_live_error(detail);
+    state.status = "live_sell_failed_retryable".into();
+    state.exit_reason = format!("{reason}:{detail}");
+    state.live_exit_reason = reason.into();
+    state.live_exit_sol = current_value_sol;
+    state.paper_exit_sol = current_value_sol;
+    state.sell_signature = sell_signature.into();
+    state.hold_secs = age;
+    state.max_favorable_pct = (highest - 1.0) * 100.0;
+    state.max_drawdown_pct = (lowest - 1.0) * 100.0;
+    ledger.save_new_position(state)?;
+    println!(
+        "❌ LIVE SELL FAILED: {} | reason={} detail={}",
+        state.mint, reason, detail
+    );
+    Ok(())
+}
+
+fn z3_live_exit_reason(age_secs: u64, ratio: f64, max_favorable_pct: f64) -> Option<&'static str> {
+    let current_pnl_pct = (ratio - 1.0) * 100.0;
+    if ratio <= 0.80 {
+        return Some("hard_stop");
+    }
+    if age_secs >= 120 && max_favorable_pct < 25.0 {
+        return Some("early_no_momentum");
+    }
+    if max_favorable_pct >= 20.0 && ratio <= 1.0 {
+        return Some("breakeven_floor");
+    }
+    if z3_live_profit_protect_exit(max_favorable_pct, current_pnl_pct) {
+        return Some("profit_protect");
+    }
+    if age_secs >= 300 {
+        return Some("max_hold");
+    }
+    None
+}
+
+fn z3_live_profit_protect_exit(max_favorable_pct: f64, current_pnl_pct: f64) -> bool {
+    const STAGES: &[(f64, f64)] = &[(150.0, 90.0), (100.0, 60.0), (60.0, 35.0), (30.0, 15.0)];
+    STAGES.iter().any(|(mfe_threshold, stop_level)| {
+        max_favorable_pct >= *mfe_threshold && current_pnl_pct <= *stop_level
+    })
+}
+
+fn latest_open_live_holding(ledger: &LedgerManager) -> anyhow::Result<Option<PositionState>> {
+    let latest = ledger.get_latest_by_mint_variant()?;
+    Ok(latest.into_values().find(|p| {
+        p.variant_id == "Z3"
+            && matches!(p.status.as_str(), "holding" | "live_sell_failed_retryable")
+            && p.remaining_tokens > 0
+    }))
+}
+
+fn target_from_live_state(state: &PositionState) -> anyhow::Result<MigrationTarget> {
+    if state.pool_state.is_empty()
+        || state.base_mint.is_empty()
+        || state.quote_mint.is_empty()
+        || state.quote_asset_mint.is_empty()
+        || state.pool_base_token_account.is_empty()
+        || state.pool_quote_token_account.is_empty()
+    {
+        anyhow::bail!("live_sell_target_incomplete for {}", state.mint);
+    }
+    Ok(MigrationTarget {
+        mint: state.mint.clone(),
+        name: state.token_name.clone(),
+        symbol: state.token_symbol.clone(),
+        source: if state.source.is_empty() {
+            "helius_migration".into()
+        } else {
+            state.source.clone()
+        },
+        pool_state: state.pool_state.clone(),
+        base_mint: state.base_mint.clone(),
+        quote_mint: state.quote_mint.clone(),
+        quote_asset_mint: state.quote_asset_mint.clone(),
+        pool_base_token_account: state.pool_base_token_account.clone(),
+        pool_quote_token_account: state.pool_quote_token_account.clone(),
+        creator: state.creator_address.clone(),
+        creator_score: state.creator_score,
+        top10_holder_pct: state.top10_holder_pct,
+        curve_velocity_secs: state.curve_velocity_secs,
+        ..Default::default()
+    })
 }
 
 fn record_quote_unsupported_shadow(
@@ -432,7 +854,13 @@ fn env_f64(key: &str, default: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_live_error;
+    use super::{
+        latest_open_live_holding, sanitize_live_error, validate_live_start, z3_live_exit_reason,
+    };
+    use crate::state::{LedgerManager, PositionState};
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn live_error_sanitizer_is_single_line_and_bounded() {
@@ -441,5 +869,119 @@ mod tests {
         assert!(!sanitized.contains('\n'));
         assert!(sanitized.len() <= 180);
         assert!(sanitized.contains("InstructionError"));
+    }
+
+    #[test]
+    fn z3_live_exit_reasons_match_canary_policy() {
+        assert_eq!(z3_live_exit_reason(10, 0.80, 0.0), Some("hard_stop"));
+        assert_eq!(
+            z3_live_exit_reason(120, 1.10, 24.9),
+            Some("early_no_momentum")
+        );
+        assert_eq!(z3_live_exit_reason(60, 1.00, 20.0), Some("breakeven_floor"));
+        assert_eq!(z3_live_exit_reason(60, 1.15, 30.0), Some("profit_protect"));
+        assert_eq!(z3_live_exit_reason(60, 1.349, 60.0), Some("profit_protect"));
+        assert_eq!(
+            z3_live_exit_reason(60, 1.599, 100.0),
+            Some("profit_protect")
+        );
+        assert_eq!(
+            z3_live_exit_reason(60, 1.899, 150.0),
+            Some("profit_protect")
+        );
+        assert_eq!(z3_live_exit_reason(300, 1.30, 29.0), Some("max_hold"));
+        assert_eq!(z3_live_exit_reason(30, 1.25, 25.0), None);
+    }
+
+    #[test]
+    fn live_start_blocks_buy_only_live_without_auto_sell_flags() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_live_env();
+        set_required_canary_env();
+        std::env::set_var("LIVE_SEND_ENABLED", "true");
+        std::env::set_var("LIVE_AUTO_SELL_ENABLED", "false");
+        std::env::set_var("LIVE_SELL_SEND_ENABLED", "false");
+
+        let err = validate_live_start(false, true).unwrap_err().to_string();
+        assert!(err.contains("LIVE_AUTO_SELL_ENABLED"));
+        clear_live_env();
+    }
+
+    #[test]
+    fn live_start_accepts_full_lifecycle_canary_flags() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_live_env();
+        set_required_canary_env();
+        std::env::set_var("LIVE_SEND_ENABLED", "true");
+        std::env::set_var("LIVE_AUTO_SELL_ENABLED", "true");
+        std::env::set_var("LIVE_SELL_SEND_ENABLED", "true");
+
+        validate_live_start(false, true).unwrap();
+        clear_live_env();
+    }
+
+    #[test]
+    fn latest_open_live_holding_ignores_live_failed() {
+        let path = std::env::temp_dir().join(format!(
+            "huragan_live_holding_test_{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let ledger = LedgerManager::new(&path);
+        ledger
+            .save_new_position(&PositionState {
+                variant_id: "Z3".into(),
+                mint: "FailedMint".into(),
+                status: "live_failed".into(),
+                remaining_tokens: 0,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(latest_open_live_holding(&ledger).unwrap().is_none());
+
+        ledger
+            .save_new_position(&PositionState {
+                variant_id: "Z3".into(),
+                mint: "OpenMint".into(),
+                status: "holding".into(),
+                remaining_tokens: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            latest_open_live_holding(&ledger).unwrap().unwrap().mint,
+            "OpenMint"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn set_required_canary_env() {
+        std::env::set_var("AMM_LIVE_CANARY", "true");
+        std::env::set_var("HELIUS_MIGRATION_ENABLED", "true");
+        std::env::set_var("PUMPPORTAL_ENABLED", "false");
+        std::env::set_var("MIGRATION_CAPTURE_MODE", "false");
+        std::env::set_var("MAX_TRADES_PER_RUN", "1");
+        std::env::set_var("JITO_TIP_LAMPORTS", "0");
+        std::env::set_var("EMERGENCY_JITO_TIP_LAMPORTS", "0");
+        std::env::set_var("BUY_AMOUNT_SOL", "0.003");
+        std::env::set_var("LIVE_VARIANT", "Z3");
+    }
+
+    fn clear_live_env() {
+        for key in [
+            "AMM_LIVE_CANARY",
+            "HELIUS_MIGRATION_ENABLED",
+            "PUMPPORTAL_ENABLED",
+            "MIGRATION_CAPTURE_MODE",
+            "MAX_TRADES_PER_RUN",
+            "JITO_TIP_LAMPORTS",
+            "EMERGENCY_JITO_TIP_LAMPORTS",
+            "BUY_AMOUNT_SOL",
+            "LIVE_VARIANT",
+            "LIVE_SEND_ENABLED",
+            "LIVE_AUTO_SELL_ENABLED",
+            "LIVE_SELL_SEND_ENABLED",
+        ] {
+            std::env::remove_var(key);
+        }
     }
 }

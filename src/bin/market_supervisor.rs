@@ -364,7 +364,10 @@ fn live_blocker_count<'a>(rows: impl IntoIterator<Item = &'a PositionLike>) -> u
         .filter(|r| {
             matches!(
                 r.status.as_str(),
-                "holding" | "dust_unwind_required" | "amm_sell_failed_retryable"
+                "holding"
+                    | "dust_unwind_required"
+                    | "amm_sell_failed_retryable"
+                    | "live_sell_failed_retryable"
             )
         })
         .count()

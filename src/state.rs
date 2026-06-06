@@ -130,6 +130,14 @@ pub struct PositionState {
     #[serde(default)]
     pub last_valid_quote_sol: f64,
     #[serde(default)]
+    pub sell_signature: String,
+    #[serde(default)]
+    pub live_exit_sol: f64,
+    #[serde(default)]
+    pub live_exit_reason: String,
+    #[serde(default)]
+    pub live_sell_family: String,
+    #[serde(default)]
     pub excluded_from_stats: bool,
     #[serde(default)]
     pub exited_early_no_momentum: bool,
