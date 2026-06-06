@@ -3,6 +3,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -161,10 +163,11 @@ impl LedgerManager {
                 fs::create_dir_all(parent)?;
             }
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.file_path)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut file = opts.open(&self.file_path)?;
         serde_json::to_writer(&mut file, state)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
@@ -178,7 +181,7 @@ impl LedgerManager {
         }
         for line in BufReader::new(File::open(&self.file_path)?)
             .lines()
-            .flatten()
+            .map_while(Result::ok)
         {
             if line.trim().is_empty() {
                 continue;
@@ -199,7 +202,7 @@ impl LedgerManager {
         }
         for line in BufReader::new(File::open(&self.file_path)?)
             .lines()
-            .flatten()
+            .map_while(Result::ok)
         {
             if line.trim().is_empty() {
                 continue;
@@ -219,7 +222,11 @@ pub fn append_jsonl(path: impl AsRef<Path>, value: &Value) -> anyhow::Result<()>
             fs::create_dir_all(parent)?;
         }
     }
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut file = opts.open(path)?;
     serde_json::to_writer(&mut file, value)?;
     file.write_all(b"\n")?;
     file.sync_all()?;

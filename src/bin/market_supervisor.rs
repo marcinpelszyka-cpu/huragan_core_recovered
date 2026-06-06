@@ -200,15 +200,7 @@ fn main() -> anyhow::Result<()> {
 
     let live_rows = parse_positions(&read_recent_jsonl(&live_state_path, 5000));
     let live_latest = dedupe_by_mint(&live_rows);
-    let blockers = live_latest
-        .values()
-        .filter(|r| {
-            matches!(
-                r.status.as_str(),
-                "holding" | "dust_unwind_required" | "amm_sell_failed_retryable"
-            )
-        })
-        .count();
+    let blockers = live_blocker_count(live_latest.values());
 
     let mut reasons = Vec::new();
     if z_completed < 50 {
@@ -333,7 +325,7 @@ fn read_recent_jsonl(path: &str, max_records: usize) -> Vec<Value> {
         Err(_) => return vec![],
     };
     let mut q = VecDeque::with_capacity(max_records + 1);
-    for line in BufReader::new(file).lines().flatten() {
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
         if let Ok(v) = serde_json::from_str::<Value>(&line) {
             q.push_back(v);
             if q.len() > max_records {
@@ -367,6 +359,17 @@ fn dedupe_by_mint(rows: &[PositionLike]) -> HashMap<String, PositionLike> {
     }
     latest
 }
+fn live_blocker_count<'a>(rows: impl IntoIterator<Item = &'a PositionLike>) -> usize {
+    rows.into_iter()
+        .filter(|r| {
+            matches!(
+                r.status.as_str(),
+                "holding" | "dust_unwind_required" | "amm_sell_failed_retryable"
+            )
+        })
+        .count()
+}
+
 fn clean_pnl_row(r: &PositionLike) -> bool {
     r.status == "paper_completed"
         && r.paper_entry_sol > 0.0
@@ -433,7 +436,7 @@ fn median(vals: &mut [f64]) -> f64 {
     }
     vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = vals.len() / 2;
-    if vals.len() % 2 == 0 {
+    if vals.len().is_multiple_of(2) {
         (vals[mid - 1] + vals[mid]) / 2.0
     } else {
         vals[mid]
@@ -446,7 +449,7 @@ fn count_jsonl(path: &str) -> usize {
         .map(|f| {
             BufReader::new(f)
                 .lines()
-                .flatten()
+                .map_while(Result::ok)
                 .filter(|l| !l.trim().is_empty())
                 .count()
         })
@@ -462,7 +465,7 @@ fn csv_rows(path: &str) -> Vec<HashMap<String, String>> {
         Ok(f) => f,
         Err(_) => return vec![],
     };
-    let mut lines = BufReader::new(file).lines().flatten();
+    let mut lines = BufReader::new(file).lines().map_while(Result::ok);
     let Some(header) = lines.next() else {
         return vec![];
     };
@@ -623,4 +626,37 @@ fn write_report(path: &str, doc: &DecisionDoc) -> std::io::Result<()> {
         writeln!(f, "- {r}")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_failed_is_not_a_live_blocker() {
+        let rows = [PositionLike {
+            mint: "MintA".into(),
+            status: "live_failed".into(),
+            ..Default::default()
+        }];
+        assert_eq!(live_blocker_count(rows.iter()), 0);
+    }
+
+    #[test]
+    fn latest_terminal_state_clears_historical_holding_blocker() {
+        let rows = vec![
+            PositionLike {
+                mint: "MintA".into(),
+                status: "holding".into(),
+                ..Default::default()
+            },
+            PositionLike {
+                mint: "MintA".into(),
+                status: "paper_completed".into(),
+                ..Default::default()
+            },
+        ];
+        let latest = dedupe_by_mint(&rows);
+        assert_eq!(live_blocker_count(latest.values()), 0);
+    }
 }

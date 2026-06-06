@@ -23,6 +23,11 @@ async fn main() -> anyhow::Result<()> {
     let mint = arg_value("--mint")?;
     let state_path = arg_value("--state").unwrap_or_else(|_| "state.jsonl".to_string());
     let rpc_url = env::var("RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8899".into());
+    if env::var("ALLOW_PLAINTEXT_PRIVATE_KEY").unwrap_or_default() != "true" {
+        anyhow::bail!(
+            "sell preflight blocked: set ALLOW_PLAINTEXT_PRIVATE_KEY=true only for explicit local/server preflight"
+        );
+    }
     let key_bs58 = env::var("SOLANA_PRIVATE_KEY_BASE58").map_err(|_| {
         anyhow::anyhow!("SOLANA_PRIVATE_KEY_BASE58 required for sell preflight signing")
     })?;
@@ -101,7 +106,7 @@ fn find_best_state_for_mint(path: &str, mint: &str) -> anyhow::Result<PositionSt
     let mut latest_complete: Option<PositionState> = None;
     let mut latest_holding: Option<PositionState> = None;
 
-    for line in BufReader::new(file).lines().flatten() {
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
         if line.trim().is_empty() {
             continue;
         }

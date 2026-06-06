@@ -172,6 +172,25 @@ pub fn env_f64(key: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+const DEFAULT_AMM_LIVE_BUY_MIN_OUT_BPS: u64 = 9000;
+
+pub fn live_buy_min_out_bps() -> u64 {
+    live_buy_min_out_bps_from_env_value(env::var("AMM_LIVE_BUY_MIN_OUT_BPS").ok().as_deref())
+}
+
+fn live_buy_min_out_bps_from_env_value(value: Option<&str>) -> u64 {
+    value
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_AMM_LIVE_BUY_MIN_OUT_BPS)
+        .min(10_000)
+}
+
+pub fn min_out_from_bps(expected: u64, bps: u64) -> u64 {
+    expected
+        .saturating_mul(bps.min(10_000))
+        .saturating_div(10_000)
+}
+
 pub async fn check_pool_sol_gate(rpc: &RpcClient, target: &MigrationTarget) -> anyhow::Result<()> {
     let threshold = env_u64("AMM_MIN_POOL_SOL_FOR_ENTRY_LAMPORTS", 2_000_000_000);
     if target.pool_base_token_account.is_empty() {
@@ -434,7 +453,6 @@ pub fn buy_exact_quote_in_data(spendable_quote_in: u64, min_base_amount_out: u64
 }
 
 #[allow(dead_code)]
-
 fn global_config_buyback_recipients(data: &[u8]) -> anyhow::Result<Vec<Pubkey>> {
     // Anchor discriminator + GlobalConfig fields up to buyback config.
     // Layout from pump-public-docs `GlobalConfig`.
@@ -847,7 +865,8 @@ pub async fn build_buy_amm_ixs_real(
         &user_quote_ata,
     )?);
 
-    let min_tokens = expected_tokens.saturating_mul(95).saturating_div(100);
+    let min_out_bps = live_buy_min_out_bps();
+    let min_tokens = min_out_from_bps(expected_tokens, min_out_bps);
 
     // Real Pump AMM SOL→coin account layout observed from successful `Instruction: Sell` tx:
     // data = discriminator + quote_lamports_in + min_coin_out.
@@ -888,8 +907,8 @@ pub async fn build_buy_amm_ixs_real(
         data,
     });
 
-    println!("  🔨 live buy(Sell ix): mint={} spend={} lamports expect={} tokens min={} tokens accounts=23 coin_program={}",
-        target.mint, spend_lamports, expected_tokens, min_tokens, coin_token_program);
+    println!("  🔨 live buy(Sell ix): mint={} spend={} lamports expect={} tokens min={} tokens min_out_bps={} accounts=23 coin_program={}",
+        target.mint, spend_lamports, expected_tokens, min_tokens, min_out_bps, coin_token_program);
     let payer_str = payer_pubkey.to_string();
     println!(
         "     accounts: pool={} user={} q_vault={} c_vault={}",
@@ -915,6 +934,7 @@ pub async fn build_buy_amm_ixs_real(
 mod tests {
     use super::{
         buy_exact_quote_in_account_count, buy_exact_quote_in_data, cpmm_out,
+        live_buy_min_out_bps_from_env_value, min_out_from_bps,
         PUMP_AMM_BUY_EXACT_QUOTE_IN_DISCRIMINATOR,
     };
 
@@ -933,5 +953,20 @@ mod tests {
         let out = cpmm_out(3_000_000, 89_000_000_000, 1_000_000_000_000_000);
         assert!(out > 0);
         assert!(out < 1_000_000_000_000_000);
+    }
+
+    #[test]
+    fn live_buy_min_out_bps_controls_min_tokens() {
+        assert_eq!(min_out_from_bps(1_000_000, 9000), 900_000);
+        assert_eq!(min_out_from_bps(1_000_000, 9500), 950_000);
+        assert_eq!(min_out_from_bps(1_000_000, 12_000), 1_000_000);
+    }
+
+    #[test]
+    fn live_buy_min_out_bps_defaults_to_9000_and_clamps() {
+        assert_eq!(live_buy_min_out_bps_from_env_value(None), 9000);
+        assert_eq!(live_buy_min_out_bps_from_env_value(Some("8500")), 8500);
+        assert_eq!(live_buy_min_out_bps_from_env_value(Some("12000")), 10_000);
+        assert_eq!(live_buy_min_out_bps_from_env_value(Some("bad")), 9000);
     }
 }

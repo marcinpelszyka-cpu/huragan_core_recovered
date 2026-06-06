@@ -172,46 +172,88 @@ async fn main() -> anyhow::Result<()> {
             }
 
             if plan.simulation_ok && live_send {
-                // Send the transaction
                 let executor = executor::Executor::new(rpc_url.clone());
-                let sig = executor
-                    .send_skip_preflight(payer_ref, &plan.instructions)
-                    .await?;
-                println!(
-                    "🚀 LIVE SENT: {} | sig={} tokens={}",
-                    target.mint, sig, plan.expected_tokens_out
-                );
-
-                // Wait for confirmation
-                executor.wait_confirmed(&sig, 10).await?;
-
-                let state = PositionState {
-                    variant_id: live_variant.clone(),
-                    mint: target.mint.clone(),
-                    tx_signature: sig.to_string(),
-                    total_tokens_bought: plan.expected_tokens_out,
-                    remaining_tokens: plan.expected_tokens_out,
-                    cost_basis_sol: plan.spend_lamports as f64 / 1e9,
-                    status: "holding".into(),
-                    source: target.source.clone(),
-                    pool_state: target.pool_state.clone(),
-                    base_mint: target.base_mint.clone(),
-                    quote_mint: target.quote_mint.clone(),
-                    quote_asset_mint: target.quote_asset_mint.clone(),
-                    quote_symbol: target.quote_asset().symbol().into(),
-                    quote_decimals: target.quote_asset().decimals(),
-                    pool_base_token_account: target.pool_base_token_account.clone(),
-                    pool_quote_token_account: target.pool_quote_token_account.clone(),
-                    paper_entry_sol: plan.spend_lamports as f64 / 1e9,
-                    paper_entry_quote: plan.spend_lamports as f64 / 1e9,
-                    paper_buy_family: plan.instruction_family.clone(),
-                    advanced_gate_passed: gate.passed,
-                    advanced_gate_reason: gate.reason,
-                    advanced_gate_mode: gate.mode,
-                    ..Default::default()
-                };
-                ledger.save_new_position(&state)?;
-                println!("📝 LIVE POSITION SAVED: {} holding", target.mint);
+                match executor
+                    .send_with_preflight(payer_ref, &plan.instructions)
+                    .await
+                {
+                    Ok(sig) => {
+                        println!(
+                            "🚀 LIVE SUBMITTED: {} | sig={} tokens={}",
+                            target.mint, sig, plan.expected_tokens_out
+                        );
+                        match executor.wait_confirmed(&sig, 10).await {
+                            Ok(()) => {
+                                let state = live_position_state(
+                                    &live_variant,
+                                    &target,
+                                    &plan,
+                                    &gate,
+                                    "holding",
+                                    sig.to_string(),
+                                    "",
+                                );
+                                if let Err(e) = ledger.save_new_position(&state) {
+                                    eprintln!(
+                                        "⚠️ LIVE STATE SAVE FAILED for {} sig={}: {e}",
+                                        target.mint, sig
+                                    );
+                                }
+                                println!(
+                                    "✅ LIVE CONFIRMED: {} | sig={} tokens={}",
+                                    target.mint, sig, plan.expected_tokens_out
+                                );
+                                println!("📝 LIVE POSITION SAVED: {} holding", target.mint);
+                            }
+                            Err(e) => {
+                                let reason = sanitize_live_error(&e.to_string());
+                                let state = live_position_state(
+                                    &live_variant,
+                                    &target,
+                                    &plan,
+                                    &gate,
+                                    "live_failed",
+                                    sig.to_string(),
+                                    &reason,
+                                );
+                                if let Err(save_err) = ledger.save_new_position(&state) {
+                                    eprintln!(
+                                        "⚠️ LIVE FAILED STATE SAVE FAILED for {} sig={}: {save_err}",
+                                        target.mint, sig
+                                    );
+                                }
+                                println!(
+                                    "❌ LIVE FAILED: {} | sig={} reason={}",
+                                    target.mint, sig, reason
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let reason = sanitize_live_error(&e.to_string());
+                        let state = live_position_state(
+                            &live_variant,
+                            &target,
+                            &plan,
+                            &gate,
+                            "live_failed",
+                            String::new(),
+                            &reason,
+                        );
+                        if let Err(save_err) = ledger.save_new_position(&state) {
+                            eprintln!(
+                                "⚠️ LIVE FAILED STATE SAVE FAILED for {}: {save_err}",
+                                target.mint
+                            );
+                        }
+                        println!(
+                            "❌ LIVE FAILED: {} | sig=<none> reason={}",
+                            target.mint, reason
+                        );
+                    }
+                }
+                // A real-send attempt consumes the canary slot regardless of success/failure.
+                // This prevents systemd/on-failure loops from submitting another canary.
                 trades_seen += 1;
             } else {
                 // Preflight-only: log but don't save fake state, don't count as trade
@@ -258,6 +300,68 @@ fn validate_live_start(paper_mode: bool, live_armed: bool) -> anyhow::Result<()>
         anyhow::bail!("AMM CANARY BLOCKED: BUY_AMOUNT_SOL must be <= 0.003");
     }
     Ok(())
+}
+
+fn live_position_state(
+    variant_id: &str,
+    target: &MigrationTarget,
+    plan: &engine::BuiltBuyPlan,
+    gate: &engine::AdvancedGateDecision,
+    status: &str,
+    tx_signature: String,
+    exit_reason: &str,
+) -> PositionState {
+    let failed = status == "live_failed";
+    PositionState {
+        variant_id: variant_id.to_string(),
+        mint: target.mint.clone(),
+        tx_signature,
+        total_tokens_bought: if failed { 0 } else { plan.expected_tokens_out },
+        remaining_tokens: if failed { 0 } else { plan.expected_tokens_out },
+        cost_basis_sol: if failed {
+            0.0
+        } else {
+            plan.spend_lamports as f64 / 1e9
+        },
+        status: status.into(),
+        source: target.source.clone(),
+        pool_state: target.pool_state.clone(),
+        base_mint: target.base_mint.clone(),
+        quote_mint: target.quote_mint.clone(),
+        quote_asset_mint: target.quote_asset_mint.clone(),
+        quote_symbol: target.quote_asset().symbol().into(),
+        quote_decimals: target.quote_asset().decimals(),
+        pool_base_token_account: target.pool_base_token_account.clone(),
+        pool_quote_token_account: target.pool_quote_token_account.clone(),
+        paper_entry_sol: if failed {
+            0.0
+        } else {
+            plan.spend_lamports as f64 / 1e9
+        },
+        paper_entry_quote: if failed {
+            0.0
+        } else {
+            plan.spend_lamports as f64 / 1e9
+        },
+        paper_buy_family: plan.instruction_family.clone(),
+        advanced_gate_passed: gate.passed,
+        advanced_gate_reason: gate.reason.clone(),
+        advanced_gate_mode: gate.mode.clone(),
+        exit_reason: exit_reason.into(),
+        excluded_from_stats: failed,
+        ..Default::default()
+    }
+}
+
+fn sanitize_live_error(error: &str) -> String {
+    let compact = error
+        .chars()
+        .map(|c| if c.is_ascii_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("_");
+    compact.chars().take(180).collect()
 }
 
 fn record_quote_unsupported_shadow(
@@ -324,4 +428,18 @@ fn env_f64(key: &str, default: f64) -> f64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_live_error;
+
+    #[test]
+    fn live_error_sanitizer_is_single_line_and_bounded() {
+        let raw = "transaction failed:\nSome(InstructionError(4, Custom(6004)))";
+        let sanitized = sanitize_live_error(raw);
+        assert!(!sanitized.contains('\n'));
+        assert!(sanitized.len() <= 180);
+        assert!(sanitized.contains("InstructionError"));
+    }
 }

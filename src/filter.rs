@@ -3,7 +3,7 @@ use crate::engine::MigrationTarget;
 pub fn static_filter(target: &MigrationTarget) -> Result<(), String> {
     let name = target.name.trim();
     let symbol = target.symbol.trim();
-    if name.len() < 2 || symbol.len() < 1 {
+    if name.len() < 2 || symbol.is_empty() {
         return Err("name_or_symbol_too_short".into());
     }
     if name.len() > 32 || symbol.len() > 16 {

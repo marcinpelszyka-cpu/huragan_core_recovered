@@ -34,6 +34,28 @@ impl Executor {
         Ok(())
     }
 
+    pub async fn send_with_preflight(
+        &self,
+        payer: &Keypair,
+        ixs: &[Instruction],
+    ) -> anyhow::Result<Signature> {
+        let bh = self.rpc.get_latest_blockhash().await?;
+        let mut tx = Transaction::new_with_payer(ixs, Some(&payer.pubkey()));
+        tx.sign(&[payer], bh);
+        let sig = self
+            .rpc
+            .send_transaction_with_config(
+                &tx,
+                RpcSendTransactionConfig {
+                    skip_preflight: false,
+                    ..RpcSendTransactionConfig::default()
+                },
+            )
+            .await?;
+        Ok(sig)
+    }
+
+    #[allow(dead_code)]
     pub async fn send_skip_preflight(
         &self,
         payer: &Keypair,
