@@ -24,10 +24,13 @@ pub async fn run_helius_log_scout(tx: mpsc::Sender<MigrationTarget>) -> anyhow::
     let mut seen_migrations: HashSet<String> = HashSet::new();
     let mut seen_buys: HashSet<String> = HashSet::new();
     let mut buy_samples_written = 0u64;
+    let mut reconnect_delay_secs = env_u64("HELIUS_WS_RECONNECT_INITIAL_SECS", 2).max(1);
+    let reconnect_max_secs = env_u64("HELIUS_WS_RECONNECT_MAX_SECS", 300).max(reconnect_delay_secs);
 
     loop {
         match connect_async(&ws_url).await {
             Ok((mut ws, _)) => {
+                reconnect_delay_secs = env_u64("HELIUS_WS_RECONNECT_INITIAL_SECS", 2).max(1);
                 let sub = serde_json::json!({
                     "jsonrpc":"2.0",
                     "id":1,
@@ -116,9 +119,26 @@ pub async fn run_helius_log_scout(tx: mpsc::Sender<MigrationTarget>) -> anyhow::
                     }
                 }
             }
-            Err(e) => eprintln!("helius reconnect: {e}"),
+            Err(e) => {
+                let msg = e.to_string();
+                if is_rate_limited_error(&msg) {
+                    eprintln!(
+                        "helius reconnect rate_limited: backing off {reconnect_delay_secs}s: {e}"
+                    );
+                } else {
+                    eprintln!("helius reconnect: backing off {reconnect_delay_secs}s: {e}");
+                }
+                sleep(Duration::from_secs(reconnect_delay_secs)).await;
+                reconnect_delay_secs =
+                    reconnect_delay_secs.saturating_mul(2).min(reconnect_max_secs);
+                continue;
+            }
         }
-        sleep(Duration::from_secs(2)).await;
+        eprintln!("helius reconnect: backing off {reconnect_delay_secs}s after websocket drop");
+        sleep(Duration::from_secs(reconnect_delay_secs)).await;
+        reconnect_delay_secs = reconnect_delay_secs
+            .saturating_mul(2)
+            .min(reconnect_max_secs);
     }
 }
 
@@ -170,20 +190,27 @@ async fn fetch_transaction_with_retry(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(400u64);
+    let rate_limit_delay_ms = env_u64("HELIUS_GET_TX_RATE_LIMIT_RETRY_MS", 5_000);
+    let max_delay_ms = env_u64("HELIUS_GET_TX_RETRY_MAX_MS", 30_000);
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..attempts {
         match fetch_transaction(client, rpc_url, signature, encoding).await {
             Ok(v) => return Ok(v),
             Err(e) => {
                 let msg = e.to_string();
-                let retryable = msg.contains("transaction_not_available")
-                    || msg.contains("rate limited")
-                    || msg.contains("-32429");
+                let rate_limited = is_rate_limited_error(&msg);
+                let retryable = msg.contains("transaction_not_available") || rate_limited;
                 last_err = Some(e);
                 if !retryable || attempt + 1 >= attempts {
                     break;
                 }
-                sleep(Duration::from_millis(delay_ms.saturating_mul(attempt + 1))).await;
+                let backoff_ms = if rate_limited {
+                    rate_limit_delay_ms.saturating_mul(attempt + 1)
+                } else {
+                    delay_ms.saturating_mul(attempt + 1)
+                }
+                .min(max_delay_ms);
+                sleep(Duration::from_millis(backoff_ms)).await;
             }
         }
     }
@@ -209,13 +236,19 @@ async fn fetch_transaction(
             }
         ]
     });
-    let resp: Value = client
+    let response = client
         .post(rpc_url)
         .json(&body)
         .send()
-        .await?
-        .json()
         .await?;
+    let status = response.status();
+    if status.as_u16() == 429 {
+        anyhow::bail!("rpc_rate_limited:http_429");
+    }
+    if !status.is_success() {
+        anyhow::bail!("rpc_http_error:{status}");
+    }
+    let resp: Value = response.json().await?;
     if let Some(err) = resp.get("error") {
         anyhow::bail!("rpc_error:{err}");
     }
@@ -224,6 +257,14 @@ async fn fetch_transaction(
         anyhow::bail!("transaction_not_available");
     }
     Ok(result)
+}
+
+fn is_rate_limited_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("429")
+        || lower.contains("too many requests")
+        || lower.contains("rate limited")
+        || lower.contains("-32429")
 }
 
 fn capture_pump_amm_buy_sample(signature: &str, tx: &Value) -> bool {
@@ -921,6 +962,15 @@ mod tests {
     fn raw_log_without_enrichment_does_not_create_target() {
         let v = serde_json::json!({"params":{"result":{"value":{"signature":"abc"}}}});
         assert!(parse_pump_amm_transaction("abc", &v).is_none());
+    }
+
+    #[test]
+    fn detects_helius_rate_limit_errors() {
+        assert!(is_rate_limited_error("HTTP error: 429 Too Many Requests"));
+        assert!(is_rate_limited_error("rpc_error:{\"code\":-32429}"));
+        assert!(is_rate_limited_error("rate limited by provider"));
+        assert!(!is_rate_limited_error("transaction_not_available"));
+        assert!(!is_rate_limited_error("ExceededSlippage"));
     }
 
     #[test]
