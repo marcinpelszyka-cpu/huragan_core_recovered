@@ -543,6 +543,17 @@ pub async fn build_sell_amm_ixs_real_preflight(
     token_amount: u64,
     payer: &Keypair,
 ) -> anyhow::Result<BuiltSellPlan> {
+    let slippage_bps = env_u64("AMM_LIVE_SELL_SLIPPAGE_BPS", 8000).min(10_000);
+    build_sell_amm_ixs_real_preflight_with_bps(rpc, target, token_amount, payer, slippage_bps).await
+}
+
+pub async fn build_sell_amm_ixs_real_preflight_with_bps(
+    rpc: &RpcClient,
+    target: &MigrationTarget,
+    token_amount: u64,
+    payer: &Keypair,
+    slippage_bps: u64,
+) -> anyhow::Result<BuiltSellPlan> {
     if !target.is_amm() {
         anyhow::bail!("non-AMM target blocked from live sell builder");
     }
@@ -648,7 +659,7 @@ pub async fn build_sell_amm_ixs_real_preflight(
         );
     }
 
-    let slippage_bps = env_u64("AMM_LIVE_SELL_SLIPPAGE_BPS", 8000).min(10_000);
+    let slippage_bps = slippage_bps.min(10_000);
     let min_sol_out = expected_sol_out
         .saturating_mul(slippage_bps)
         .saturating_div(10_000);
@@ -695,8 +706,8 @@ pub async fn build_sell_amm_ixs_real_preflight(
         data,
     });
 
-    println!("  🔨 live sell preflight(buy_exact_quote_in): mint={} tokens={} expect_sol={} min_sol={} accounts={} quote_program={}",
-        target.mint, token_amount, expected_sol_out, min_sol_out, account_count, quote_token_program);
+    println!("  🔨 live sell preflight(buy_exact_quote_in): mint={} tokens={} expect_sol={} min_sol={} min_out_bps={} accounts={} quote_program={}",
+        target.mint, token_amount, expected_sol_out, min_sol_out, slippage_bps, account_count, quote_token_program);
 
     Ok(BuiltSellPlan {
         instructions,

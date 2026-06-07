@@ -642,18 +642,49 @@ async fn execute_live_sell(
         };
     state.live_sell_family = sell.instruction_family.clone();
     if let Err(e) = sell.simulate_preflight(rpc, payer).await {
-        return save_live_sell_failed(
-            ledger,
-            state,
-            reason,
-            age,
-            current_value_sol,
-            highest,
-            lowest,
-            "",
-            &format!("sell_preflight_failed:{e}"),
-        )
-        .await;
+        let standard_error = sanitize_live_error(&format!("sell_preflight_failed:{e}"));
+        match build_first_passing_rescue_sell(rpc, target, token_balance, payer, &standard_error)
+            .await
+        {
+            Ok(Some((rescue_sell, rescue_bps))) => {
+                sell = rescue_sell;
+                state.live_sell_family =
+                    format!("{}:rescue_bps_{}", sell.instruction_family, rescue_bps);
+                notifier::send_telegram_alert(format!(
+                    "🛠 HURAGAN RESCUE SELL PREFLIGHT OK\nmint={}\nreason={}\nrescue_bps={}\nmin_sol_out={}\nstandard_error={}",
+                    state.mint, reason, rescue_bps, sell.min_sol_out, standard_error
+                ))
+                .await;
+            }
+            Ok(None) => {
+                return save_live_sell_failed(
+                    ledger,
+                    state,
+                    "rescue_preflight_failed",
+                    age,
+                    current_value_sol,
+                    highest,
+                    lowest,
+                    "",
+                    &standard_error,
+                )
+                .await;
+            }
+            Err(rescue_error) => {
+                return save_live_sell_failed(
+                    ledger,
+                    state,
+                    "rescue_preflight_failed",
+                    age,
+                    current_value_sol,
+                    highest,
+                    lowest,
+                    "",
+                    &format!("{standard_error};rescue_error:{rescue_error}"),
+                )
+                .await;
+            }
+        }
     }
     if !env_bool("LIVE_SELL_SEND_ENABLED", false) {
         println!(
@@ -687,12 +718,21 @@ async fn execute_live_sell(
                     } else {
                         0.0
                     };
-                    state.exit_reason = reason.into();
+                    let final_reason = if state.live_sell_family.contains(":rescue_bps_") {
+                        format!("rescue_sell:{reason}")
+                    } else {
+                        reason.into()
+                    };
+                    state.exit_reason = final_reason;
                     state.live_exit_reason = reason.into();
                     state.hold_secs = age;
                     state.max_favorable_pct = (highest - 1.0) * 100.0;
                     state.max_drawdown_pct = (lowest - 1.0) * 100.0;
-                    state.live_sell_family = sell.instruction_family.clone();
+                    if state.live_sell_family.is_empty()
+                        || !state.live_sell_family.contains(":rescue_bps_")
+                    {
+                        state.live_sell_family = sell.instruction_family.clone();
+                    }
                     ledger.save_new_position(state)?;
                     println!(
                         "✅ LIVE SELL CONFIRMED: {} | sig={} reason={} exit_sol={:.9}",
@@ -742,6 +782,74 @@ async fn execute_live_sell(
             .await
         }
     }
+}
+
+fn rescue_sell_bps_list() -> Vec<u64> {
+    rescue_sell_bps_list_from_env_value(env::var("AMM_LIVE_SELL_RESCUE_BPS_LIST").ok().as_deref())
+}
+
+fn rescue_sell_bps_list_from_env_value(value: Option<&str>) -> Vec<u64> {
+    let parsed: Vec<u64> = value
+        .unwrap_or("7000,5000,3000,1000,100")
+        .split(',')
+        .filter_map(|part| part.trim().parse::<u64>().ok())
+        .filter(|bps| *bps > 0)
+        .map(|bps| bps.min(10_000))
+        .collect();
+    if parsed.is_empty() {
+        vec![7000, 5000, 3000, 1000, 100]
+    } else {
+        parsed
+    }
+}
+
+async fn build_first_passing_rescue_sell(
+    rpc: &RpcClient,
+    target: &MigrationTarget,
+    token_balance: u64,
+    payer: &Keypair,
+    standard_error: &str,
+) -> anyhow::Result<Option<(engine::BuiltSellPlan, u64)>> {
+    notifier::send_telegram_alert(format!(
+        "🚨 HURAGAN RESCUE SELL NEEDED\nmint={}\ntokens={}\nstandard_error={}",
+        target.mint, token_balance, standard_error
+    ))
+    .await;
+    let mut last_error = String::new();
+    for rescue_bps in rescue_sell_bps_list() {
+        println!(
+            "🛠️ LIVE SELL RESCUE PREFLIGHT: {} | bps={} tokens={}",
+            target.mint, rescue_bps, token_balance
+        );
+        let mut plan = match engine::build_sell_amm_ixs_real_preflight_with_bps(
+            rpc,
+            target,
+            token_balance,
+            payer,
+            rescue_bps,
+        )
+        .await
+        {
+            Ok(plan) => plan,
+            Err(e) => {
+                last_error = sanitize_live_error(&format!("build_rescue_sell_failed:{e}"));
+                continue;
+            }
+        };
+        match plan.simulate_preflight(rpc, payer).await {
+            Ok(()) => return Ok(Some((plan, rescue_bps))),
+            Err(e) => {
+                last_error = sanitize_live_error(&format!("rescue_sell_preflight_failed:{e}"));
+            }
+        }
+    }
+    if !last_error.is_empty() {
+        println!(
+            "❌ LIVE SELL RESCUE PREFLIGHT EXHAUSTED: {} | detail={}",
+            target.mint, last_error
+        );
+    }
+    Ok(None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -917,7 +1025,8 @@ fn env_f64(key: &str, default: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        latest_open_live_holding, sanitize_live_error, validate_live_start, z3_live_exit_reason,
+        latest_open_live_holding, rescue_sell_bps_list_from_env_value, sanitize_live_error,
+        validate_live_start, z3_live_exit_reason,
     };
     use crate::state::{LedgerManager, PositionState};
     use std::sync::Mutex;
@@ -998,6 +1107,26 @@ mod tests {
     }
 
     #[test]
+    fn rescue_sell_bps_parser_uses_safe_defaults_and_clamps() {
+        assert_eq!(
+            rescue_sell_bps_list_from_env_value(Some("7000,5000,100")),
+            vec![7000, 5000, 100]
+        );
+        assert_eq!(
+            rescue_sell_bps_list_from_env_value(Some("bad,0,")),
+            vec![7000, 5000, 3000, 1000, 100]
+        );
+        assert_eq!(
+            rescue_sell_bps_list_from_env_value(Some("12000,1")),
+            vec![10_000, 1]
+        );
+        assert_eq!(
+            rescue_sell_bps_list_from_env_value(None),
+            vec![7000, 5000, 3000, 1000, 100]
+        );
+    }
+
+    #[test]
     fn latest_open_live_holding_ignores_live_failed() {
         let path = std::env::temp_dir().join(format!(
             "huragan_live_holding_test_{}.jsonl",
@@ -1019,15 +1148,14 @@ mod tests {
             .save_new_position(&PositionState {
                 variant_id: "Z3".into(),
                 mint: "OpenMint".into(),
-                status: "holding".into(),
+                status: "live_sell_failed_retryable".into(),
                 remaining_tokens: 10,
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(
-            latest_open_live_holding(&ledger).unwrap().unwrap().mint,
-            "OpenMint"
-        );
+        let open = latest_open_live_holding(&ledger).unwrap().unwrap();
+        assert_eq!(open.mint, "OpenMint");
+        assert_eq!(open.status, "live_sell_failed_retryable");
         let _ = std::fs::remove_file(path);
     }
 
