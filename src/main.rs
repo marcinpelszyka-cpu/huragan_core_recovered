@@ -89,6 +89,11 @@ async fn main() -> anyhow::Result<()> {
                 "🔄 LIVE AUTO-SELL RESUME: mint={} remaining_tokens={}",
                 open.mint, open.remaining_tokens
             );
+            notifier::send_telegram_alert(format!(
+                "⚠️ HURAGAN LIVE RECOVERY\nopen holding detected\nmint={}\nremaining_tokens={}\naction=auto_sell_resume",
+                open.mint, open.remaining_tokens
+            ))
+            .await;
             run_z3_live_auto_sell_monitor(&rpc, &executor, &ledger, &target, &mut open, payer_ref)
                 .await?;
             return Ok(());
@@ -229,6 +234,15 @@ async fn main() -> anyhow::Result<()> {
                                     target.mint, sig, plan.expected_tokens_out
                                 );
                                 println!("📝 LIVE POSITION SAVED: {} holding", target.mint);
+                                notifier::send_telegram_alert(format!(
+                                    "✅ HURAGAN Z3 BUY CONFIRMED\nmint={}\nbuy_sig={}\ntokens={}\ncost_sol={:.9}\nauto_sell={}",
+                                    target.mint,
+                                    sig,
+                                    plan.expected_tokens_out,
+                                    plan.spend_lamports as f64 / 1e9,
+                                    env_bool("LIVE_AUTO_SELL_ENABLED", false)
+                                ))
+                                .await;
                                 if env_bool("LIVE_AUTO_SELL_ENABLED", false) {
                                     let mut live_state = state;
                                     run_z3_live_auto_sell_monitor(
@@ -263,6 +277,11 @@ async fn main() -> anyhow::Result<()> {
                                     "❌ LIVE FAILED: {} | sig={} reason={}",
                                     target.mint, sig, reason
                                 );
+                                notifier::send_telegram_alert(format!(
+                                    "❌ HURAGAN LIVE FAILED\nmint={}\nsig={}\nreason={}",
+                                    target.mint, sig, reason
+                                ))
+                                .await;
                             }
                         }
                     }
@@ -287,6 +306,11 @@ async fn main() -> anyhow::Result<()> {
                             "❌ LIVE FAILED: {} | sig=<none> reason={}",
                             target.mint, reason
                         );
+                        notifier::send_telegram_alert(format!(
+                            "❌ HURAGAN LIVE FAILED\nmint={}\nsig=<none>\nreason={}",
+                            target.mint, reason
+                        ))
+                        .await;
                     }
                 }
                 // A real-send attempt consumes the canary slot regardless of success/failure.
@@ -482,6 +506,11 @@ async fn run_z3_live_auto_sell_monitor(
                 "✅ LIVE SELL CONFIRMED: {} | already_empty=true",
                 state.mint
             );
+            notifier::send_telegram_alert(format!(
+                "✅ HURAGAN Z3 SELL COMPLETED\nmint={}\nreason=token_balance_zero\nremaining_tokens=0",
+                state.mint
+            ))
+            .await;
             return Ok(());
         }
 
@@ -570,7 +599,8 @@ async fn execute_live_sell(
                 lowest,
                 "",
                 &detail,
-            );
+            )
+            .await;
         }
     };
     if token_balance == 0 {
@@ -584,6 +614,11 @@ async fn execute_live_sell(
             "✅ LIVE SELL CONFIRMED: {} | already_empty=true",
             state.mint
         );
+        notifier::send_telegram_alert(format!(
+            "✅ HURAGAN Z3 SELL COMPLETED\nmint={}\nreason=token_balance_zero\nremaining_tokens=0",
+            state.mint
+        ))
+        .await;
         return Ok(());
     }
 
@@ -601,7 +636,8 @@ async fn execute_live_sell(
                     lowest,
                     "",
                     &format!("build_sell_failed:{e}"),
-                );
+                )
+                .await;
             }
         };
     state.live_sell_family = sell.instruction_family.clone();
@@ -616,7 +652,8 @@ async fn execute_live_sell(
             lowest,
             "",
             &format!("sell_preflight_failed:{e}"),
-        );
+        )
+        .await;
     }
     if !env_bool("LIVE_SELL_SEND_ENABLED", false) {
         println!(
@@ -661,37 +698,54 @@ async fn execute_live_sell(
                         "✅ LIVE SELL CONFIRMED: {} | sig={} reason={} exit_sol={:.9}",
                         state.mint, sig, reason, state.live_exit_sol
                     );
+                    notifier::send_telegram_alert(format!(
+                        "✅ HURAGAN Z3 CANARY COMPLETED\nmint={}\nbuy_sig={}\nsell_sig={}\nreason={}\nexit_sol={:.9}\npnl_sol={:+.9}\npnl_pct={:+.2}%\nremaining_tokens=0",
+                        state.mint,
+                        state.tx_signature,
+                        sig,
+                        reason,
+                        state.live_exit_sol,
+                        state.realized_pnl_sol,
+                        state.net_pnl_pct
+                    ))
+                    .await;
                     Ok(())
                 }
-                Err(e) => save_live_sell_failed(
-                    ledger,
-                    state,
-                    reason,
-                    age,
-                    current_value_sol,
-                    highest,
-                    lowest,
-                    &sig.to_string(),
-                    &format!("sell_confirm_failed:{e}"),
-                ),
+                Err(e) => {
+                    save_live_sell_failed(
+                        ledger,
+                        state,
+                        reason,
+                        age,
+                        current_value_sol,
+                        highest,
+                        lowest,
+                        &sig.to_string(),
+                        &format!("sell_confirm_failed:{e}"),
+                    )
+                    .await
+                }
             }
         }
-        Err(e) => save_live_sell_failed(
-            ledger,
-            state,
-            reason,
-            age,
-            current_value_sol,
-            highest,
-            lowest,
-            "",
-            &format!("sell_submit_failed:{e}"),
-        ),
+        Err(e) => {
+            save_live_sell_failed(
+                ledger,
+                state,
+                reason,
+                age,
+                current_value_sol,
+                highest,
+                lowest,
+                "",
+                &format!("sell_submit_failed:{e}"),
+            )
+            .await
+        }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn save_live_sell_failed(
+async fn save_live_sell_failed(
     ledger: &LedgerManager,
     state: &mut PositionState,
     reason: &str,
@@ -717,6 +771,11 @@ fn save_live_sell_failed(
         "❌ LIVE SELL FAILED: {} | reason={} detail={}",
         state.mint, reason, detail
     );
+    notifier::send_telegram_alert(format!(
+        "🚨 HURAGAN LIVE SELL FAILED\nmint={}\nreason={}\ndetail={}\nstatus=live_sell_failed_retryable",
+        state.mint, reason, detail
+    ))
+    .await;
     Ok(())
 }
 

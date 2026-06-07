@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import urllib.request
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +42,109 @@ def read_csv(path):
         return []
     with open(path, newline="") as f:
         return list(csv.DictReader(f))
+
+def read_env_file(path):
+    vals = {}
+    if not path.exists():
+        return vals
+    with open(path, errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            vals[k] = v
+    return vals
+
+
+def systemctl_is_active(service):
+    try:
+        proc = subprocess.run(
+            ["systemctl", "is-active", service],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        return proc.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def runtime_safety(root):
+    env_vals = read_env_file(root / ".env")
+    services = {
+        "migration-sniper.service": systemctl_is_active("migration-sniper.service"),
+        "fresh-momentum.service": systemctl_is_active("fresh-momentum.service"),
+    }
+    paper = env_vals.get("PAPER_MODE", "true") == "true"
+    key_present = bool(env_vals.get("SOLANA_PRIVATE_KEY_BASE58"))
+    return {
+        "services": services,
+        "paper_mode": paper,
+        "live_armed": env_vals.get("LIVE_ARMED", "false") == "true",
+        "live_send_enabled": env_vals.get("LIVE_SEND_ENABLED", "false") == "true",
+        "live_auto_sell_enabled": env_vals.get("LIVE_AUTO_SELL_ENABLED", "false") == "true",
+        "live_sell_send_enabled": env_vals.get("LIVE_SELL_SEND_ENABLED", "false") == "true",
+        "allow_plaintext_private_key": env_vals.get("ALLOW_PLAINTEXT_PRIVATE_KEY", "false") == "true",
+        "private_key_present": key_present,
+        "telegram_token_present": bool(env_vals.get("TELEGRAM_BOT_TOKEN")),
+        "telegram_chat_present": bool(env_vals.get("TELEGRAM_CHAT_ID")),
+        "rpc_send_url_present": bool(env_vals.get("RPC_SEND_URL")),
+    }
+
+
+def latest_live_states(state_rows):
+    latest = {}
+    for row in state_rows:
+        mint = row.get("mint")
+        variant = row.get("variant_id")
+        if not mint or variant != "Z3":
+            continue
+        if row.get("tx_signature") or str(row.get("status", "")).startswith("live") or row.get("status") in ("holding", "completed"):
+            latest[(mint, variant)] = row
+    return list(latest.values())
+
+
+def live_safety_metrics(state_rows):
+    latest = latest_live_states(state_rows)
+    open_rows = [r for r in latest if r.get("status") in ("holding", "live_sell_failed_retryable") and fnum(r.get("remaining_tokens")) > 0]
+    failed = [r for r in latest if r.get("status") == "live_failed"]
+    sell_failed = [r for r in latest if r.get("status") == "live_sell_failed_retryable"]
+    completed = [r for r in latest if r.get("status") == "completed" and r.get("sell_signature")]
+    return {
+        "open_live_holdings": len(open_rows),
+        "live_failed": len(failed),
+        "live_sell_failed_retryable": len(sell_failed),
+        "live_completed": len(completed),
+        "latest_completed": completed[-1] if completed else None,
+    }
+
+
+def send_telegram_report(root, text):
+    env_vals = read_env_file(root / ".env")
+    token = env_vals.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = env_vals.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        return False
+    # Telegram hard limit is 4096 chars. Keep room for truncation marker.
+    if len(text) > 3900:
+        text = text[:3900] + "\n…truncated"
+    body = json.dumps({
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }).encode()
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
 
 
 def read_state_jsonl(path):
@@ -178,6 +282,19 @@ def diff_metrics(current, previous):
 
 def build_alerts(snapshot, previous):
     alerts = []
+    runtime = snapshot.get("runtime_safety", {})
+    for service, status in runtime.get("services", {}).items():
+        if status != "active":
+            alerts.append(f"Service inactive: {service}={status}")
+    if runtime.get("paper_mode") and runtime.get("private_key_present"):
+        alerts.append("SECURITY: private key present while PAPER_MODE=true")
+    if runtime.get("live_send_enabled") and not runtime.get("live_auto_sell_enabled"):
+        alerts.append("SECURITY: live send enabled without auto-sell")
+    live = snapshot.get("live_safety", {})
+    if live.get("open_live_holdings", 0) > 0:
+        alerts.append(f"Live holding open: count={live.get('open_live_holdings')}")
+    if live.get("live_sell_failed_retryable", 0) > 0:
+        alerts.append(f"Live sell failed retryable: count={live.get('live_sell_failed_retryable')}")
     z3 = next((m for m in snapshot["variant_metrics"] if m["variant"] == "Z3"), None)
     if z3:
         pu_pct = pct(z3["price_unavailable"], max(z3["completed"], 1))
@@ -236,6 +353,22 @@ def format_report(snapshot, previous, decision_doc, deltas, alerts):
             f"{m['median_pnl_pct']:+.2f}% | {m['total_sol']:+.6f} | {m['profit_protect']} | {m['early_no_momentum']} |"
         )
     lines.append("")
+    runtime = snapshot.get("runtime_safety", {})
+    live = snapshot.get("live_safety", {})
+    lines.append("## Runtime")
+    lines.append(
+        f"paper_mode={str(runtime.get('paper_mode')).lower()}, live_send={str(runtime.get('live_send_enabled')).lower()}, "
+        f"private_key={'PRESENT' if runtime.get('private_key_present') else 'ABSENT'}, "
+        f"telegram={'PRESENT' if runtime.get('telegram_token_present') else 'ABSENT'}, "
+        f"open_live_holdings={live.get('open_live_holdings',0)}, live_completed={live.get('live_completed',0)}"
+    )
+    latest = live.get("latest_completed") or {}
+    if latest:
+        lines.append(
+            f"Latest live: mint={latest.get('mint','')}, reason={latest.get('exit_reason','')}, "
+            f"pnl={fnum(latest.get('realized_pnl_sol')):+.9f} SOL, status={latest.get('status','')}"
+        )
+    lines.append("")
     lines.append("## Fresh")
     lines.append(
         f"tracked={fresh.get('tracked_mints',0)}, WSOL={fresh.get('wsol_tracked_mints',0)}, "
@@ -278,12 +411,15 @@ def main():
         "--report", supervisor_report,
     ], root)
 
-    state_rows = latest_terminal_by_mint_variant(read_state_jsonl(root / "state.jsonl"), args.window_mins)
+    all_state_rows = read_state_jsonl(root / "state.jsonl")
+    state_rows = latest_terminal_by_mint_variant(all_state_rows, args.window_mins)
     snapshot = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "window_mins": args.window_mins,
         "variant_metrics": [variant_metrics(state_rows, v) for v in ["Z", "Z3", "Z3.1"]],
         "fresh_metrics": load_fresh_metrics(dataset_dir, root),
+        "runtime_safety": runtime_safety(root),
+        "live_safety": live_safety_metrics(all_state_rows),
     }
     previous = read_json(args.snapshot) or {}
     decision_doc = read_json(decision_path) or {}
@@ -295,11 +431,13 @@ def main():
     snapshot["live_allowed"] = decision_doc.get("live_allowed")
 
     report = format_report(snapshot, previous, decision_doc, deltas, alerts)
-    Path(args.output_json).write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n")
     Path(args.output_md).write_text(report)
+    sent = send_telegram_report(root, report)
+    snapshot["telegram_report_sent"] = sent
+    Path(args.output_json).write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n")
     Path(args.snapshot).write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n")
     print(report)
-
+    print(f"TELEGRAM_REPORT_SENT={str(sent).lower()}")
 
 if __name__ == "__main__":
     try:
