@@ -340,6 +340,9 @@ fn validate_live_start(paper_mode: bool, live_armed: bool) -> anyhow::Result<()>
         anyhow::bail!("AMM CANARY BLOCKED: LIVE_VARIANT must be Z3");
     }
     if env_bool("LIVE_SEND_ENABLED", false) {
+        if env::var("LIVE_SEND_BACKEND").unwrap_or_else(|_| "rpc".into()) != "rpc" {
+            anyhow::bail!("AMM CANARY BLOCKED: LIVE_SEND_BACKEND must be rpc in this build");
+        }
         if !env_bool("LIVE_AUTO_SELL_ENABLED", false) {
             anyhow::bail!("AMM CANARY BLOCKED: LIVE_AUTO_SELL_ENABLED must be true for live send");
         }
@@ -921,6 +924,21 @@ mod tests {
     }
 
     #[test]
+    fn live_start_blocks_future_non_rpc_backend() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_live_env();
+        set_required_canary_env();
+        std::env::set_var("LIVE_SEND_ENABLED", "true");
+        std::env::set_var("LIVE_AUTO_SELL_ENABLED", "true");
+        std::env::set_var("LIVE_SELL_SEND_ENABLED", "true");
+        std::env::set_var("LIVE_SEND_BACKEND", "pumpportal_lightning_later");
+
+        let err = validate_live_start(false, true).unwrap_err().to_string();
+        assert!(err.contains("LIVE_SEND_BACKEND"));
+        clear_live_env();
+    }
+
+    #[test]
     fn latest_open_live_holding_ignores_live_failed() {
         let path = std::env::temp_dir().join(format!(
             "huragan_live_holding_test_{}.jsonl",
@@ -980,6 +998,7 @@ mod tests {
             "LIVE_SEND_ENABLED",
             "LIVE_AUTO_SELL_ENABLED",
             "LIVE_SELL_SEND_ENABLED",
+            "LIVE_SEND_BACKEND",
         ] {
             std::env::remove_var(key);
         }
