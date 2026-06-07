@@ -10,7 +10,7 @@ Environment=FRESH_MOMENTUM_CAPTURE=only
 Environment=PAPER_MODE=true
 Environment=LIVE_ARMED=false
 ExecStart=/opt/huragan_core/target/release/huragan_core
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 # hardening
