@@ -203,6 +203,43 @@ async fn main() -> anyhow::Result<()> {
             }
 
             if plan.simulation_ok && live_send {
+                // Final reserve gate directly before submit. A pool can pass the
+                // initial quote/preflight checks and still be drained before the
+                // live transaction is sent. Re-checking the WSOL reserve here
+                // prevents paying fees into already-dusted/rugged pools.
+                if let Err(e) = engine::check_pool_sol_gate(&rpc, &target).await {
+                    let reason = sanitize_live_error(&format!("pool_sol_final_gate_blocked:{e}"));
+                    let state = live_position_state(
+                        &live_variant,
+                        &target,
+                        &plan,
+                        &gate,
+                        "live_failed",
+                        String::new(),
+                        &reason,
+                    );
+                    if let Err(save_err) = ledger.save_new_position(&state) {
+                        eprintln!(
+                            "⚠️ LIVE FINAL GATE STATE SAVE FAILED for {}: {save_err}",
+                            target.mint
+                        );
+                    }
+                    println!(
+                        "⛔ LIVE FINAL GATE BLOCKED: {} | reason={}",
+                        target.mint, reason
+                    );
+                    notifier::send_telegram_alert(format!(
+                        "⛔ HURAGAN LIVE FINAL GATE BLOCKED\nmint={}\nreason={}",
+                        target.mint, reason
+                    ))
+                    .await;
+                    trades_seen += 1;
+                    if trades_seen >= max_trades {
+                        break;
+                    }
+                    continue;
+                }
+
                 let executor = executor::Executor::new(rpc_url.clone());
                 match executor
                     .send_with_preflight(payer_ref, &plan.instructions)
