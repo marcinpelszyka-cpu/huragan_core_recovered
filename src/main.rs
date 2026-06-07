@@ -13,6 +13,7 @@ mod state;
 mod strategy;
 
 use crate::engine::{MigrationTarget, QuoteAsset};
+use crate::executor::TxTerminalStatus;
 use crate::state::{LedgerManager, PositionState};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::signature::Keypair;
@@ -212,8 +213,8 @@ async fn main() -> anyhow::Result<()> {
                             "🚀 LIVE SUBMITTED: {} | sig={} tokens={}",
                             target.mint, sig, plan.expected_tokens_out
                         );
-                        match executor.wait_confirmed(&sig, 10).await {
-                            Ok(()) => {
+                        match executor.wait_terminal_status(&sig, 10).await? {
+                            TxTerminalStatus::Confirmed => {
                                 let state = live_position_state(
                                     &live_variant,
                                     &target,
@@ -235,7 +236,12 @@ async fn main() -> anyhow::Result<()> {
                                 );
                                 println!("📝 LIVE POSITION SAVED: {} holding", target.mint);
                                 notifier::send_telegram_alert(format!(
-                                    "✅ HURAGAN Z3 BUY CONFIRMED\nmint={}\nbuy_sig={}\ntokens={}\ncost_sol={:.9}\nauto_sell={}",
+                                    "✅ HURAGAN Z3 BUY CONFIRMED
+mint={}
+buy_sig={}
+tokens={}
+cost_sol={:.9}
+auto_sell={}",
                                     target.mint,
                                     sig,
                                     plan.expected_tokens_out,
@@ -256,8 +262,9 @@ async fn main() -> anyhow::Result<()> {
                                     .await?;
                                 }
                             }
-                            Err(e) => {
-                                let reason = sanitize_live_error(&e.to_string());
+                            TxTerminalStatus::Failed(err) => {
+                                let reason =
+                                    sanitize_live_error(&format!("transaction_failed:{err}"));
                                 let state = live_position_state(
                                     &live_variant,
                                     &target,
@@ -278,7 +285,42 @@ async fn main() -> anyhow::Result<()> {
                                     target.mint, sig, reason
                                 );
                                 notifier::send_telegram_alert(format!(
-                                    "❌ HURAGAN LIVE FAILED\nmint={}\nsig={}\nreason={}",
+                                    "❌ HURAGAN LIVE FAILED
+mint={}
+sig={}
+reason={}",
+                                    target.mint, sig, reason
+                                ))
+                                .await;
+                            }
+                            TxTerminalStatus::TimeoutUnknown => {
+                                let reason = sanitize_live_error(&format!(
+                                    "confirmation_timeout_unknown:{sig}"
+                                ));
+                                let state = live_position_state(
+                                    &live_variant,
+                                    &target,
+                                    &plan,
+                                    &gate,
+                                    "live_failed",
+                                    sig.to_string(),
+                                    &reason,
+                                );
+                                if let Err(save_err) = ledger.save_new_position(&state) {
+                                    eprintln!(
+                                        "⚠️ LIVE FAILED STATE SAVE FAILED for {} sig={}: {save_err}",
+                                        target.mint, sig
+                                    );
+                                }
+                                println!(
+                                    "❌ LIVE FAILED: {} | sig={} reason={}",
+                                    target.mint, sig, reason
+                                );
+                                notifier::send_telegram_alert(format!(
+                                    "❌ HURAGAN LIVE FAILED
+mint={}
+sig={}
+reason={}",
                                     target.mint, sig, reason
                                 ))
                                 .await;
@@ -703,8 +745,8 @@ async fn execute_live_sell(
                 "🚀 LIVE SELL SUBMITTED: {} | sig={} reason={} tokens={}",
                 state.mint, sig, reason, token_balance
             );
-            match executor.wait_confirmed(&sig, 10).await {
-                Ok(()) => {
+            match executor.wait_terminal_status(&sig, 10).await? {
+                TxTerminalStatus::Confirmed => {
                     state.status = "completed".into();
                     state.remaining_tokens = 0;
                     state.sell_signature = sig.to_string();
@@ -739,7 +781,15 @@ async fn execute_live_sell(
                         state.mint, sig, reason, state.live_exit_sol
                     );
                     notifier::send_telegram_alert(format!(
-                        "✅ HURAGAN Z3 CANARY COMPLETED\nmint={}\nbuy_sig={}\nsell_sig={}\nreason={}\nexit_sol={:.9}\npnl_sol={:+.9}\npnl_pct={:+.2}%\nremaining_tokens=0",
+                        "✅ HURAGAN Z3 CANARY COMPLETED
+mint={}
+buy_sig={}
+sell_sig={}
+reason={}
+exit_sol={:.9}
+pnl_sol={:+.9}
+pnl_pct={:+.2}%
+remaining_tokens=0",
                         state.mint,
                         state.tx_signature,
                         sig,
@@ -751,7 +801,7 @@ async fn execute_live_sell(
                     .await;
                     Ok(())
                 }
-                Err(e) => {
+                TxTerminalStatus::Failed(err) => {
                     save_live_sell_failed(
                         ledger,
                         state,
@@ -761,7 +811,21 @@ async fn execute_live_sell(
                         highest,
                         lowest,
                         &sig.to_string(),
-                        &format!("sell_confirm_failed:{e}"),
+                        &format!("sell_confirm_failed:{err}"),
+                    )
+                    .await
+                }
+                TxTerminalStatus::TimeoutUnknown => {
+                    save_live_sell_failed(
+                        ledger,
+                        state,
+                        reason,
+                        age,
+                        current_value_sol,
+                        highest,
+                        lowest,
+                        &sig.to_string(),
+                        &format!("sell_confirm_timeout_unknown:{sig}"),
                     )
                     .await
                 }
@@ -937,11 +1001,7 @@ fn target_from_live_state(state: &PositionState) -> anyhow::Result<MigrationTarg
         mint: state.mint.clone(),
         name: state.token_name.clone(),
         symbol: state.token_symbol.clone(),
-        source: if state.source.is_empty() {
-            "helius_migration".into()
-        } else {
-            state.source.clone()
-        },
+        source: "helius_migration".into(),
         pool_state: state.pool_state.clone(),
         base_mint: state.base_mint.clone(),
         quote_mint: state.quote_mint.clone(),
@@ -1026,7 +1086,7 @@ fn env_f64(key: &str, default: f64) -> f64 {
 mod tests {
     use super::{
         latest_open_live_holding, rescue_sell_bps_list_from_env_value, sanitize_live_error,
-        validate_live_start, z3_live_exit_reason,
+        target_from_live_state, validate_live_start, z3_live_exit_reason,
     };
     use crate::state::{LedgerManager, PositionState};
     use std::sync::Mutex;
@@ -1124,6 +1184,27 @@ mod tests {
             rescue_sell_bps_list_from_env_value(None),
             vec![7000, 5000, 3000, 1000, 100]
         );
+    }
+
+    #[test]
+    fn target_from_live_state_normalizes_source_for_recovery_sell() {
+        let target = target_from_live_state(&PositionState {
+            variant_id: "Z3".into(),
+            mint: "Mint".into(),
+            status: "holding".into(),
+            source: "live".into(),
+            pool_state: "Pool".into(),
+            base_mint: "So11111111111111111111111111111111111111112".into(),
+            quote_mint: "Mint".into(),
+            quote_asset_mint: "So11111111111111111111111111111111111111112".into(),
+            pool_base_token_account: "BaseVault".into(),
+            pool_quote_token_account: "TokenVault".into(),
+            remaining_tokens: 10,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(target.source, "helius_migration");
+        assert!(target.is_amm());
     }
 
     #[test]

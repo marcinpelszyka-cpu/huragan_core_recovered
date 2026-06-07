@@ -15,6 +15,13 @@ pub struct Executor {
     preflight_commitment_level: CommitmentLevel,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxTerminalStatus {
+    Confirmed,
+    Failed(String),
+    TimeoutUnknown,
+}
+
 impl Executor {
     pub fn new(rpc_url: String) -> Self {
         let send_url = live_send_rpc_url_from_env(&rpc_url);
@@ -128,19 +135,57 @@ impl Executor {
         Ok(sig)
     }
 
-    pub async fn wait_confirmed(&self, sig: &Signature, attempts: usize) -> anyhow::Result<()> {
+    pub async fn wait_terminal_status(
+        &self,
+        sig: &Signature,
+        attempts: usize,
+    ) -> anyhow::Result<TxTerminalStatus> {
         for _ in 0..attempts {
             let statuses = self.rpc.get_signature_statuses(&[*sig]).await?;
             if let Some(Some(status)) = statuses.value.first() {
-                if status.err.is_none() {
-                    return Ok(());
-                }
-                anyhow::bail!("transaction failed: {:?}", status.err);
+                return Ok(tx_terminal_status_from_error(
+                    status.err.as_ref().map(|e| format!("{:?}", e)),
+                ));
             }
             sleep(Duration::from_millis(500)).await;
         }
-        anyhow::bail!("confirmation timeout: {}", sig);
+
+        let statuses = self
+            .rpc
+            .get_signature_statuses_with_history(&[*sig])
+            .await?;
+        if let Some(Some(status)) = statuses.value.first() {
+            return Ok(tx_terminal_status_from_error(
+                status.err.as_ref().map(|e| format!("{:?}", e)),
+            ));
+        }
+        Ok(TxTerminalStatus::TimeoutUnknown)
     }
+
+    #[allow(dead_code)]
+    pub async fn wait_confirmed(&self, sig: &Signature, attempts: usize) -> anyhow::Result<()> {
+        match self.wait_terminal_status(sig, attempts).await? {
+            TxTerminalStatus::Confirmed => Ok(()),
+            TxTerminalStatus::Failed(err) => anyhow::bail!("transaction failed: {err}"),
+            TxTerminalStatus::TimeoutUnknown => {
+                anyhow::bail!("confirmation timeout unknown: {sig}")
+            }
+        }
+    }
+}
+
+fn tx_terminal_status_from_error(error: Option<String>) -> TxTerminalStatus {
+    match error {
+        Some(err) => TxTerminalStatus::Failed(err),
+        None => TxTerminalStatus::Confirmed,
+    }
+}
+
+#[cfg(test)]
+fn tx_terminal_status_from_optional_error(
+    error: Option<Option<String>>,
+) -> Option<TxTerminalStatus> {
+    error.map(tx_terminal_status_from_error)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,12 +286,26 @@ mod tests {
     use super::{
         commitment_label, is_retryable_blockhash_error, live_send_backend_from_env_value,
         live_send_preflight_attempts, live_send_preflight_commitment_level_from_env_value,
-        live_send_rpc_max_retries, live_send_rpc_url_from_env_value, LiveSendBackend,
+        live_send_rpc_max_retries, live_send_rpc_url_from_env_value,
+        tx_terminal_status_from_optional_error, LiveSendBackend, TxTerminalStatus,
     };
     use solana_sdk::commitment_config::CommitmentLevel;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn terminal_status_mapping_handles_confirmed_failed_and_unknown() {
+        assert_eq!(
+            tx_terminal_status_from_optional_error(Some(None)),
+            Some(TxTerminalStatus::Confirmed)
+        );
+        assert_eq!(
+            tx_terminal_status_from_optional_error(Some(Some("InstructionError".into()))),
+            Some(TxTerminalStatus::Failed("InstructionError".into()))
+        );
+        assert_eq!(tx_terminal_status_from_optional_error(None), None);
+    }
 
     #[test]
     fn blockhash_errors_are_retryable() {
