@@ -203,6 +203,19 @@ def open_live_blockers(rows):
     return [r for r in latest.values() if r.get("status") in OPEN_STATUSES and is_live_row(r)]
 
 
+def live_outcome_category(r):
+    status = r.get("status", "")
+    reason = r.get("exit_reason", "") or r.get("live_exit_reason", "")
+    pnl = fnum(r.get("realized_pnl_sol") or r.get("net_pnl_sol"))
+    if status == "completed":
+        return "completed_profit" if pnl > 0 else "completed_loss"
+    if status == "live_failed" and reason.startswith("live_entry_"):
+        return "live_failed_entry_gate"
+    if status == "unrecoverable_dust_or_rug":
+        return "unrecoverable_dust_or_rug"
+    return status or "unknown"
+
+
 def canary_rows(rows):
     live = latest_live_rows(rows)
     out = []
@@ -213,6 +226,7 @@ def canary_rows(rows):
         out.append({
             "mint": r.get("mint", ""),
             "status": status,
+            "outcome_category": live_outcome_category(r),
             "buy_tx": r.get("tx_signature", ""),
             "sell_tx": r.get("sell_signature", ""),
             "exit_reason": r.get("live_exit_reason") or r.get("exit_reason", ""),
@@ -269,11 +283,16 @@ def write_report(path: Path, metrics, bands, canaries, blockers, state_path):
         if not canaries:
             f.write("No live canary rows found.\n")
         else:
-            f.write("| Mint | Status | Exit | Hold s | PnL SOL | PnL % | Remaining | Sell tx |\n")
-            f.write("|---|---|---|---:|---:|---:|---:|---|\n")
+            counts = Counter(r.get("outcome_category", "unknown") for r in canaries)
+            f.write("Outcome counts:\n")
+            for key in ["completed_profit", "completed_loss", "live_failed_entry_gate", "unrecoverable_dust_or_rug", "live_failed", "live_sell_failed_retryable"]:
+                if counts.get(key):
+                    f.write(f"- {key}: {counts[key]}\n")
+            f.write("\n| Mint | Category | Status | Exit | Hold s | PnL SOL | PnL % | Remaining | Sell tx |\n")
+            f.write("|---|---|---|---|---:|---:|---:|---:|---|\n")
             for r in canaries:
                 sell = "yes" if r.get("sell_tx") else ""
-                f.write(f"| {r['mint']} | {r['status']} | {r['exit_reason']} | {r['hold_secs']} | {r['pnl_sol']:.9f} | {r['pnl_pct']:.2f} | {r['remaining_tokens']} | {sell} |\n")
+                f.write(f"| {r['mint']} | {r['outcome_category']} | {r['status']} | {r['exit_reason']} | {r['hold_secs']} | {r['pnl_sol']:.9f} | {r['pnl_pct']:.2f} | {r['remaining_tokens']} | {sell} |\n")
         f.write("\n## Notes\n\n")
         f.write("- This is an outcome audit, not a tick-level re-simulation.\n")
         f.write("- True parameter sweep requires per-position quote/value time series. Terminal rows alone cannot prove alternate exits without bias.\n")
@@ -308,7 +327,7 @@ def main():
         "total_sol", "top_exit", "profit_protect", "early_no_momentum", "hard_stop", "max_hold",
     ])
     write_csv(out / "z3_live_canary_ledger.csv", canaries, [
-        "mint", "status", "buy_tx", "sell_tx", "exit_reason", "hold_secs", "pnl_sol", "pnl_pct", "remaining_tokens", "terminal",
+        "mint", "outcome_category", "status", "buy_tx", "sell_tx", "exit_reason", "hold_secs", "pnl_sol", "pnl_pct", "remaining_tokens", "terminal",
     ])
     write_report(out / "z3_outcome_audit.md", metrics, bands, canaries, blockers, state_path)
 

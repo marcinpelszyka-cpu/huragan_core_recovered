@@ -135,6 +135,25 @@ pub struct BuiltBuyPlan {
     pub token_ata: Option<Pubkey>,
     pub wsol_ata: Option<Pubkey>,
     pub simulation_ok: bool,
+    pub entry_quote_reserve_raw: u64,
+    pub entry_token_reserve_raw: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveEntryStabilitySample {
+    pub quote_reserve_raw: u64,
+    pub token_reserve_raw: u64,
+    pub buy_quote_raw: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveEntryStabilityDecision {
+    pub passed: bool,
+    pub reason: String,
+    pub min_quote_reserve_raw: u64,
+    pub max_quote_reserve_drop_bps: u64,
+    pub max_buy_quote_drop_bps: u64,
+    pub samples: Vec<LiveEntryStabilitySample>,
 }
 
 #[allow(dead_code)]
@@ -191,8 +210,12 @@ pub fn min_out_from_bps(expected: u64, bps: u64) -> u64 {
         .saturating_div(10_000)
 }
 
+pub fn min_pool_sol_for_entry_lamports() -> u64 {
+    env_u64("AMM_MIN_POOL_SOL_FOR_ENTRY_LAMPORTS", 2_000_000_000)
+}
+
 pub async fn check_pool_sol_gate(rpc: &RpcClient, target: &MigrationTarget) -> anyhow::Result<()> {
-    let threshold = env_u64("AMM_MIN_POOL_SOL_FOR_ENTRY_LAMPORTS", 2_000_000_000);
+    let threshold = min_pool_sol_for_entry_lamports();
     if target.pool_base_token_account.is_empty() {
         anyhow::bail!("pool base token account missing");
     }
@@ -265,7 +288,12 @@ pub async fn process_migration_and_build_amm_ixs(
         anyhow::bail!("non-AMM target blocked from AMM builder");
     }
     check_pool_sol_gate(rpc, target).await?;
-    let quote = quote_buy_amm(rpc, target, spend_lamports).await?;
+    let (entry_quote_reserve_raw, entry_token_reserve_raw) = pool_reserves(rpc, target).await?;
+    let quote = quote_buy_from_reserves(
+        spend_lamports,
+        entry_quote_reserve_raw,
+        entry_token_reserve_raw,
+    );
     if quote == 0 {
         anyhow::bail!("amm buy quote unavailable");
     }
@@ -274,6 +302,8 @@ pub async fn process_migration_and_build_amm_ixs(
     if let Some(payer) = payer {
         let live_send = env::var("LIVE_SEND_ENABLED").unwrap_or_default() == "true";
         let mut plan = build_buy_amm_ixs_real(rpc, target, spend_lamports, quote, payer).await?;
+        plan.entry_quote_reserve_raw = entry_quote_reserve_raw;
+        plan.entry_token_reserve_raw = entry_token_reserve_raw;
 
         if simulate {
             let simulation_ok = plan.simulate_preflight(rpc, payer).await;
@@ -312,6 +342,8 @@ pub async fn process_migration_and_build_amm_ixs(
         token_ata: None,
         wsol_ata: None,
         simulation_ok: false,
+        entry_quote_reserve_raw,
+        entry_token_reserve_raw,
     })
 }
 
@@ -352,9 +384,113 @@ pub async fn quote_buy_amm(
     spend_lamports: u64,
 ) -> anyhow::Result<u64> {
     let (sol_reserve, token_reserve) = pool_reserves(rpc, target).await?;
+    Ok(quote_buy_from_reserves(
+        spend_lamports,
+        sol_reserve,
+        token_reserve,
+    ))
+}
+
+fn quote_buy_from_reserves(spend_lamports: u64, sol_reserve: u64, token_reserve: u64) -> u64 {
     let haircut_bps = env_u64("PAPER_AMM_QUOTE_HAIRCUT_BPS", 9700);
     let out = cpmm_out(spend_lamports, sol_reserve, token_reserve);
-    Ok(out.saturating_mul(haircut_bps).saturating_div(10_000))
+    out.saturating_mul(haircut_bps).saturating_div(10_000)
+}
+
+pub async fn live_entry_stability_gate(
+    rpc: &RpcClient,
+    target: &MigrationTarget,
+    spend_lamports: u64,
+) -> anyhow::Result<LiveEntryStabilityDecision> {
+    let sample_count = env_u64("AMM_LIVE_ENTRY_STABILITY_SAMPLES", 3).clamp(1, 5);
+    let interval_ms = env_u64("AMM_LIVE_ENTRY_STABILITY_INTERVAL_MS", 1000).min(5_000);
+    let mut samples = Vec::with_capacity(sample_count as usize);
+    for idx in 0..sample_count {
+        let (quote_reserve_raw, token_reserve_raw) = pool_reserves(rpc, target).await?;
+        let buy_quote_raw =
+            quote_buy_from_reserves(spend_lamports, quote_reserve_raw, token_reserve_raw);
+        samples.push(LiveEntryStabilitySample {
+            quote_reserve_raw,
+            token_reserve_raw,
+            buy_quote_raw,
+        });
+        if idx + 1 < sample_count {
+            sleep(Duration::from_millis(interval_ms)).await;
+        }
+    }
+    Ok(evaluate_live_entry_stability(
+        samples,
+        min_pool_sol_for_entry_lamports(),
+        env_u64("AMM_LIVE_ENTRY_MAX_RESERVE_DROP_BPS", 2000).min(10_000),
+        env_u64("AMM_LIVE_ENTRY_MAX_QUOTE_DROP_BPS", 2500).min(10_000),
+    ))
+}
+
+pub fn evaluate_live_entry_stability(
+    samples: Vec<LiveEntryStabilitySample>,
+    min_quote_reserve_raw: u64,
+    max_reserve_drop_bps_allowed: u64,
+    max_quote_drop_bps_allowed: u64,
+) -> LiveEntryStabilityDecision {
+    let min_seen_quote_reserve_raw = samples
+        .iter()
+        .map(|s| s.quote_reserve_raw)
+        .min()
+        .unwrap_or(0);
+    if samples.is_empty() {
+        return LiveEntryStabilityDecision {
+            passed: false,
+            reason: "live_entry_unstable_pool:no_samples".into(),
+            min_quote_reserve_raw: 0,
+            max_quote_reserve_drop_bps: 10_000,
+            max_buy_quote_drop_bps: 10_000,
+            samples,
+        };
+    }
+
+    let max_reserve_drop_bps = max_pairwise_drop_bps(samples.iter().map(|s| s.quote_reserve_raw));
+    let max_quote_drop_bps = max_pairwise_drop_bps(samples.iter().map(|s| s.buy_quote_raw));
+    let zero_quote = samples.iter().any(|s| s.buy_quote_raw == 0);
+    let below_min = samples
+        .iter()
+        .any(|s| s.quote_reserve_raw < min_quote_reserve_raw);
+
+    let reason = if below_min {
+        "live_entry_unstable_pool"
+    } else if zero_quote {
+        "live_entry_quote_zero"
+    } else if max_reserve_drop_bps > max_reserve_drop_bps_allowed {
+        "live_entry_reserve_drop"
+    } else if max_quote_drop_bps > max_quote_drop_bps_allowed {
+        "live_entry_quote_collapse"
+    } else {
+        "live_entry_stable"
+    };
+
+    LiveEntryStabilityDecision {
+        passed: reason == "live_entry_stable",
+        reason: reason.into(),
+        min_quote_reserve_raw: min_seen_quote_reserve_raw,
+        max_quote_reserve_drop_bps: max_reserve_drop_bps,
+        max_buy_quote_drop_bps: max_quote_drop_bps,
+        samples,
+    }
+}
+
+fn max_pairwise_drop_bps(values: impl Iterator<Item = u64>) -> u64 {
+    let vals: Vec<u64> = values.collect();
+    vals.windows(2)
+        .map(|w| drop_bps(w[0], w[1]))
+        .max()
+        .unwrap_or(0)
+}
+
+fn drop_bps(previous: u64, current: u64) -> u64 {
+    if previous == 0 || current >= previous {
+        0
+    } else {
+        previous.saturating_sub(current).saturating_mul(10_000) / previous
+    }
 }
 
 pub async fn quote_sell_amm(
@@ -967,6 +1103,8 @@ pub async fn build_buy_amm_ixs_real(
         token_ata: Some(user_coin_ata),
         wsol_ata: Some(user_quote_ata),
         simulation_ok: false,
+        entry_quote_reserve_raw: 0,
+        entry_token_reserve_raw: 0,
     })
 }
 
@@ -974,9 +1112,84 @@ pub async fn build_buy_amm_ixs_real(
 mod tests {
     use super::{
         buy_exact_quote_in_account_count, buy_exact_quote_in_data, cpmm_out,
-        live_buy_min_out_bps_from_env_value, min_out_from_bps,
-        PUMP_AMM_BUY_EXACT_QUOTE_IN_DISCRIMINATOR,
+        evaluate_live_entry_stability, live_buy_min_out_bps_from_env_value, min_out_from_bps,
+        LiveEntryStabilitySample, PUMP_AMM_BUY_EXACT_QUOTE_IN_DISCRIMINATOR,
     };
+
+    fn stability_sample(reserve: u64, quote: u64) -> LiveEntryStabilitySample {
+        LiveEntryStabilitySample {
+            quote_reserve_raw: reserve,
+            token_reserve_raw: 1_000_000,
+            buy_quote_raw: quote,
+        }
+    }
+
+    #[test]
+    fn live_entry_stability_passes_stable_reserves() {
+        let decision = evaluate_live_entry_stability(
+            vec![
+                stability_sample(3_000_000_000, 1_000_000),
+                stability_sample(2_950_000_000, 990_000),
+                stability_sample(2_940_000_000, 985_000),
+            ],
+            2_000_000_000,
+            2000,
+            2500,
+        );
+        assert!(decision.passed);
+        assert_eq!(decision.reason, "live_entry_stable");
+    }
+
+    #[test]
+    fn live_entry_stability_rejects_reserve_below_min() {
+        let decision = evaluate_live_entry_stability(
+            vec![stability_sample(1_999_999_999, 1_000_000)],
+            2_000_000_000,
+            2000,
+            2500,
+        );
+        assert!(!decision.passed);
+        assert_eq!(decision.reason, "live_entry_unstable_pool");
+    }
+
+    #[test]
+    fn live_entry_stability_rejects_reserve_drop() {
+        let decision = evaluate_live_entry_stability(
+            vec![
+                stability_sample(3_000_000_000, 1_000_000),
+                stability_sample(2_300_000_000, 990_000),
+            ],
+            2_000_000_000,
+            2000,
+            2500,
+        );
+        assert!(!decision.passed);
+        assert_eq!(decision.reason, "live_entry_reserve_drop");
+    }
+
+    #[test]
+    fn live_entry_stability_rejects_quote_collapse_and_zero() {
+        let collapse = evaluate_live_entry_stability(
+            vec![
+                stability_sample(3_000_000_000, 1_000_000),
+                stability_sample(3_000_000_000, 700_000),
+            ],
+            2_000_000_000,
+            2000,
+            2500,
+        );
+        assert!(!collapse.passed);
+        assert_eq!(collapse.reason, "live_entry_quote_collapse");
+
+        let zero = evaluate_live_entry_stability(
+            vec![stability_sample(3_000_000_000, 0)],
+            2_000_000_000,
+            2000,
+            2500,
+        );
+        assert!(!zero.passed);
+        assert_eq!(zero.reason, "live_entry_quote_zero");
+    }
 
     #[test]
     fn buy_exact_quote_in_layout_is_stable() {

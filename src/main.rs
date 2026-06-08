@@ -240,6 +240,89 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
+                let stability = match engine::live_entry_stability_gate(&rpc, &target, buy_lamports)
+                    .await
+                {
+                    Ok(decision) => decision,
+                    Err(e) => {
+                        let reason = sanitize_live_error(&format!("live_entry_unstable_pool:{e}"));
+                        let state = live_position_state(
+                            &live_variant,
+                            &target,
+                            &plan,
+                            &gate,
+                            "live_failed",
+                            String::new(),
+                            &reason,
+                        );
+                        if let Err(save_err) = ledger.save_new_position(&state) {
+                            eprintln!(
+                                "⚠️ LIVE ENTRY GATE STATE SAVE FAILED for {}: {save_err}",
+                                target.mint
+                            );
+                        }
+                        println!(
+                            "⛔ LIVE ENTRY GATE BLOCKED: {} | reason={}",
+                            target.mint, reason
+                        );
+                        notifier::send_telegram_alert(format!(
+                            "⛔ HURAGAN LIVE ENTRY GATE BLOCKED\nmint={}\nreason={}",
+                            target.mint, reason
+                        ))
+                        .await;
+                        trades_seen += 1;
+                        if trades_seen >= max_trades {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                if !stability.passed {
+                    let reason = sanitize_live_error(&format!(
+                        "{}:min_reserve={}:reserve_drop_bps={}:quote_drop_bps={}",
+                        stability.reason,
+                        stability.min_quote_reserve_raw,
+                        stability.max_quote_reserve_drop_bps,
+                        stability.max_buy_quote_drop_bps
+                    ));
+                    let state = live_position_state(
+                        &live_variant,
+                        &target,
+                        &plan,
+                        &gate,
+                        "live_failed",
+                        String::new(),
+                        &reason,
+                    );
+                    if let Err(save_err) = ledger.save_new_position(&state) {
+                        eprintln!(
+                            "⚠️ LIVE ENTRY GATE STATE SAVE FAILED for {}: {save_err}",
+                            target.mint
+                        );
+                    }
+                    println!(
+                        "⛔ LIVE ENTRY GATE BLOCKED: {} | reason={} samples={:?}",
+                        target.mint, reason, stability.samples
+                    );
+                    notifier::send_telegram_alert(format!(
+                        "⛔ HURAGAN LIVE ENTRY GATE BLOCKED\nmint={}\nreason={}",
+                        target.mint, reason
+                    ))
+                    .await;
+                    trades_seen += 1;
+                    if trades_seen >= max_trades {
+                        break;
+                    }
+                    continue;
+                }
+                println!(
+                    "✅ LIVE ENTRY GATE OK: {} | min_reserve={} reserve_drop_bps={} quote_drop_bps={}",
+                    target.mint,
+                    stability.min_quote_reserve_raw,
+                    stability.max_quote_reserve_drop_bps,
+                    stability.max_buy_quote_drop_bps
+                );
+
                 let executor = executor::Executor::new(rpc_url.clone());
                 match executor
                     .send_with_preflight(payer_ref, &plan.instructions)
@@ -497,6 +580,10 @@ fn live_position_state(
         } else {
             plan.spend_lamports as f64 / 1e9
         },
+        quote_reserve_raw: plan.entry_quote_reserve_raw,
+        quote_reserve_ui: plan.entry_quote_reserve_raw as f64 / 1e9,
+        entry_quote_reserve_raw: plan.entry_quote_reserve_raw,
+        min_quote_reserve_raw: plan.entry_quote_reserve_raw,
         paper_buy_family: plan.instruction_family.clone(),
         advanced_gate_passed: gate.passed,
         advanced_gate_reason: gate.reason.clone(),
@@ -591,6 +678,16 @@ async fn run_z3_live_auto_sell_monitor(
             ))
             .await;
             return Ok(());
+        }
+
+        if let Ok((quote_reserve, _token_reserve)) = engine::pool_reserves(rpc, target).await {
+            state.quote_reserve_raw = quote_reserve;
+            state.quote_reserve_ui = quote_reserve as f64 / 1e9;
+            state.min_quote_reserve_raw = if state.min_quote_reserve_raw == 0 {
+                quote_reserve
+            } else {
+                state.min_quote_reserve_raw.min(quote_reserve)
+            };
         }
 
         let current_value_sol = match engine::quote_sell_amm(rpc, target, token_balance).await {
@@ -787,6 +884,19 @@ async fn execute_live_sell(
                     state.status = "completed".into();
                     state.remaining_tokens = 0;
                     state.sell_signature = sig.to_string();
+                    if let Ok((quote_reserve, _token_reserve)) =
+                        engine::pool_reserves(rpc, target).await
+                    {
+                        state.quote_reserve_raw = quote_reserve;
+                        state.quote_reserve_ui = quote_reserve as f64 / 1e9;
+                        state.exit_quote_reserve_raw = quote_reserve;
+                        state.exit_quote_reserve_ui = state.quote_reserve_ui;
+                        state.min_quote_reserve_raw = if state.min_quote_reserve_raw == 0 {
+                            quote_reserve
+                        } else {
+                            state.min_quote_reserve_raw.min(quote_reserve)
+                        };
+                    }
                     state.live_exit_sol = sell.expected_sol_out as f64 / 1e9;
                     state.paper_exit_sol = state.live_exit_sol;
                     state.realized_pnl_sol = state.live_exit_sol - state.cost_basis_sol;

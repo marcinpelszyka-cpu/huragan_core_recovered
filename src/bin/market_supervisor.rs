@@ -57,6 +57,10 @@ struct Metrics {
     excluded_rate_pct: f64,
     advanced_gate_passed_count: usize,
     live_blocker_count: usize,
+    live_completed_profit: usize,
+    live_completed_loss: usize,
+    live_failed_entry_gate: usize,
+    live_unrecoverable_dust_or_rug: usize,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -200,7 +204,24 @@ fn main() -> anyhow::Result<()> {
 
     let live_rows = parse_positions(&read_recent_jsonl(&live_state_path, 5000));
     let live_latest = dedupe_by_mint(&live_rows);
-    let blockers = live_blocker_count(live_latest.values());
+    let live_latest_rows = live_latest.values().cloned().collect::<Vec<_>>();
+    let blockers = live_blocker_count(live_latest_rows.iter());
+    let live_completed_profit = live_latest_rows
+        .iter()
+        .filter(|r| r.status == "completed" && r.net_pnl_sol > 0.0)
+        .count();
+    let live_completed_loss = live_latest_rows
+        .iter()
+        .filter(|r| r.status == "completed" && r.net_pnl_sol <= 0.0)
+        .count();
+    let live_failed_entry_gate = live_latest_rows
+        .iter()
+        .filter(|r| r.status == "live_failed" && r.exit_reason.starts_with("live_entry_"))
+        .count();
+    let live_unrecoverable_dust_or_rug = live_latest_rows
+        .iter()
+        .filter(|r| r.status == "unrecoverable_dust_or_rug")
+        .count();
 
     let mut reasons = Vec::new();
     if z_completed < 50 {
@@ -295,6 +316,10 @@ fn main() -> anyhow::Result<()> {
             excluded_rate_pct: excluded_rate,
             advanced_gate_passed_count: adv_pass,
             live_blocker_count: blockers,
+            live_completed_profit,
+            live_completed_loss,
+            live_failed_entry_gate,
+            live_unrecoverable_dust_or_rug,
         },
         variant_metrics,
         migration_metrics: migration_dataset_metrics,
@@ -611,6 +636,23 @@ fn write_report(path: &str, doc: &DecisionDoc) -> std::io::Result<()> {
         f,
         "- No trade data: {:.1}%",
         doc.fresh_metrics.no_trade_data_pct
+    )?;
+    writeln!(f, "## Live Canary Outcomes")?;
+    writeln!(
+        f,
+        "- Completed profit: {}",
+        doc.metrics.live_completed_profit
+    )?;
+    writeln!(f, "- Completed loss: {}", doc.metrics.live_completed_loss)?;
+    writeln!(
+        f,
+        "- Entry-gate rejected: {}",
+        doc.metrics.live_failed_entry_gate
+    )?;
+    writeln!(
+        f,
+        "- Unrecoverable dust/rug: {}",
+        doc.metrics.live_unrecoverable_dust_or_rug
     )?;
     writeln!(f, "## Recommended Actions")?;
     writeln!(
