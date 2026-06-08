@@ -106,13 +106,32 @@ def append_jsonl(path, row):
 
 
 class Rpc:
-    def __init__(self, url, sleep_s=0.0):
+    def __init__(self, url, sleep_s=0.0, retries=3, backoff_s=1.5):
         self.url = url
         self.sleep_s = sleep_s
+        self.retries = max(0, int(retries))
+        self.backoff_s = max(0.0, float(backoff_s))
         self.calls = 0
         self.errors = Counter()
+        self.retry_events = 0
 
     def call(self, method, params):
+        last = None
+        for attempt in range(self.retries + 1):
+            try:
+                return self._call_once(method, params)
+            except RuntimeError as e:
+                last = e
+                retryable = "429" in str(e) or "transport_error" in str(e)
+                if not retryable or attempt >= self.retries:
+                    raise
+                self.retry_events += 1
+                delay = self.backoff_s * (attempt + 1)
+                if delay:
+                    time.sleep(delay)
+        raise last or RuntimeError("rpc_unknown_error")
+
+    def _call_once(self, method, params):
         self.calls += 1
         if self.sleep_s:
             time.sleep(self.sleep_s)
@@ -536,7 +555,7 @@ def run(args):
         return {"dry_run": True, "rpc_missing": True, "processed_mints": 0, "live_allowed": False}
     if not args.rpc_url:
         raise SystemExit("RPC_URL missing; pass --rpc-url or source .env")
-    rpc = Rpc(args.rpc_url, sleep_s=args.rpc_sleep)
+    rpc = Rpc(args.rpc_url, sleep_s=args.rpc_sleep, retries=args.rpc_retries, backoff_s=args.rpc_backoff)
     candidates = load_candidates(args.input, args.events_input, args.limit_mints)
     wallet_classes = load_wallet_classes(args.wallet_scores)
     outcomes = load_outcomes(args.state)
@@ -573,6 +592,7 @@ def run(args):
         "rpc_calls": rpc.calls,
         "errors_total": err_total,
         "errors": dict(rpc.errors),
+        "retry_events": rpc.retry_events,
         "error_pct": round(err_total / max(1, rpc.calls) * 100, 4),
         "dry_run": args.dry_run,
         "live_allowed": False,
@@ -627,6 +647,8 @@ def main():
     ap.add_argument("--min-buy-sol", type=float, default=0.01)
     ap.add_argument("--min-funding-sol", type=float, default=0.001)
     ap.add_argument("--rpc-sleep", type=float, default=0.0)
+    ap.add_argument("--rpc-retries", type=int, default=3)
+    ap.add_argument("--rpc-backoff", type=float, default=1.5)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()

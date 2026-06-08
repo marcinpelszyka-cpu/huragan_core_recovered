@@ -41,7 +41,9 @@ python3 scripts/bundler_funding_backtest.py \
   --limit-mints 500 \
   --funding-lookback-min 60 \
   --early-window-sec 10 \
-  --rpc-sleep 0.35
+  --rpc-sleep 0.35 \
+  --rpc-retries 3 \
+  --rpc-backoff 1.5
 ```
 
 ## Outputy
@@ -93,7 +95,7 @@ DEV_SNIPER_SUSPECT / shared mother cluster to avoid
 ```text
 processed_mints >= 500
 early_buyer_clusters >= 100
-429 error pct < 5%
+429 error pct < 5% after retry/backoff
 top mother wallets repeat across multiple mints
 risk_score correlates with hard_stop/rug/dust outcomes
 follow_score correlates with positive 30s/60s forward outcome
