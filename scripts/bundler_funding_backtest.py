@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -160,6 +161,37 @@ class Rpc:
         return out.get("result")
 
 
+class WalletApi:
+    """Small Helius Wallet API client for funded-by lookups.
+
+    Wallet API is beta and costs 100 credits per call, so it is never the
+    default funding source. Use it explicitly with
+    --funding-source-method wallet-api or hybrid.
+    """
+
+    def __init__(self, api_key, sleep_s=0.0):
+        self.api_key = api_key
+        self.sleep_s = sleep_s
+        self.calls = 0
+        self.errors = Counter()
+
+    def funded_by(self, wallet):
+        self.calls += 1
+        if self.sleep_s:
+            time.sleep(self.sleep_s)
+        url = f"https://api.helius.xyz/v1/wallet/{urllib.parse.quote(wallet)}/funded-by"
+        req = urllib.request.Request(url, headers={"X-Api-Key": self.api_key, "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as e:
+            self.errors[f"http_{e.code}"] += 1
+            return None
+        except Exception:
+            self.errors["transport"] += 1
+            return None
+
+
 def error_bucket(text):
     if "429" in text or "Too Many" in text:
         return "429"
@@ -170,6 +202,25 @@ def error_bucket(text):
     if "http_error:" in text:
         return text.split("http_error:", 1)[1].split()[0]
     return "rpc"
+
+
+def extract_api_key_from_url(url):
+    if not url:
+        return ""
+    try:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        vals = qs.get("api-key") or qs.get("api_key") or []
+        return vals[0] if vals else ""
+    except Exception:
+        return ""
+
+
+def selected_helius_api_key(args, rpc_url):
+    if args.helius_api_key_env:
+        val = load_dotenv_value(args.helius_api_key_env, "")
+        if val:
+            return val
+    return extract_api_key_from_url(rpc_url)
 
 
 def gtfa_fetch(rpc, address, *, start_time=None, end_time=None, limit=1000, max_pages=1):
@@ -405,6 +456,7 @@ def find_funding_source_from_rows(rows, buyer, buy_time, min_sol=0.001):
         if not best or row_best["funding_sol"] > best["funding_sol"]:
             best = row_best
     return best or {
+        "funding_source_method": "gtfa",
         "mother_wallet": "",
         "funding_signature": "",
         "funding_time": 0,
@@ -412,6 +464,65 @@ def find_funding_source_from_rows(rows, buyer, buy_time, min_sol=0.001):
         "funding_sol": 0.0,
         "source_sol_delta": 0.0,
     }
+
+
+def wallet_api_funding_source(wallet_api, buyer, buy_time, lookback_secs):
+    if not wallet_api:
+        return None
+    row = wallet_api.funded_by(buyer)
+    if not isinstance(row, dict) or not row.get("funder"):
+        return None
+    ts = inum(row.get("timestamp"), 0)
+    age = max(0, buy_time - ts) if ts and buy_time else 0
+    return {
+        "funding_source_method": "wallet-api",
+        "mother_wallet": row.get("funder") or "",
+        "funding_signature": row.get("signature") or "",
+        "funding_time": ts,
+        "funding_age_before_buy_secs": age,
+        "funding_sol": fnum(row.get("amount"), 0.0),
+        "source_sol_delta": 0.0,
+        "wallet_api_funder_type": row.get("funderType") or "",
+        "wallet_api_funder_name_present": bool(row.get("funderName")),
+        "wallet_api_within_lookback": bool(ts and buy_time and 0 <= age <= lookback_secs),
+    }
+
+
+def funding_source_for_buyer(rpc, wallet_api, buyer, buy_time, args):
+    method = args.funding_source_method
+    lookback_secs = args.funding_lookback_min * 60
+    if method in {"wallet-api", "hybrid"}:
+        api_funding = wallet_api_funding_source(wallet_api, buyer, buy_time, lookback_secs)
+        if api_funding:
+            return api_funding
+        if method == "wallet-api":
+            return {
+                "funding_source_method": "wallet-api",
+                "mother_wallet": "",
+                "funding_signature": "",
+                "funding_time": 0,
+                "funding_age_before_buy_secs": 0,
+                "funding_sol": 0.0,
+                "source_sol_delta": 0.0,
+                "wallet_api_funder_type": "",
+                "wallet_api_funder_name_present": False,
+                "wallet_api_within_lookback": False,
+            }
+
+    fund_rows = gtfa_fetch(
+        rpc,
+        buyer,
+        start_time=buy_time - lookback_secs,
+        end_time=buy_time,
+        limit=args.funding_page_limit,
+        max_pages=args.funding_max_pages,
+    )
+    funding = find_funding_source_from_rows(fund_rows, buyer, buy_time, min_sol=args.min_funding_sol)
+    funding["funding_source_method"] = "gtfa" if method == "gtfa" else "hybrid_gtfa_fallback"
+    funding.setdefault("wallet_api_funder_type", "")
+    funding.setdefault("wallet_api_funder_name_present", False)
+    funding.setdefault("wallet_api_within_lookback", False)
+    return funding
 
 
 def classify_cluster(early_buyers, edges, wallet_classes, outcome):
@@ -500,7 +611,7 @@ def write_clusters_csv(path, clusters):
             w.writerow({k: json.dumps(r.get(k)) if k == "top_mother_wallets" else r.get(k, "") for k in fields})
 
 
-def build_for_mint(rpc, candidate, args, wallet_classes, outcomes):
+def build_for_mint(rpc, wallet_api, candidate, args, wallet_classes, outcomes):
     mint = candidate["mint"]
     hint = inum(candidate.get("first_block_time_hint"), 0)
     start = hint - 5 if hint else None
@@ -520,15 +631,7 @@ def build_for_mint(rpc, candidate, args, wallet_classes, outcomes):
     for b in early_unique:
         buyer = b["owner"]
         buy_time = b["timestamp"]
-        fund_rows = gtfa_fetch(
-            rpc,
-            buyer,
-            start_time=buy_time - args.funding_lookback_min * 60,
-            end_time=buy_time,
-            limit=args.funding_page_limit,
-            max_pages=args.funding_max_pages,
-        )
-        funding = find_funding_source_from_rows(fund_rows, buyer, buy_time, min_sol=args.min_funding_sol)
+        funding = funding_source_for_buyer(rpc, wallet_api, buyer, buy_time, args)
         edge = {
             "mint": mint,
             "buyer_wallet": buyer,
@@ -576,6 +679,12 @@ def run(args):
     if not rpc_url:
         raise SystemExit("RPC_URL missing; pass --rpc-url, --rpc-env-key, or source .env")
     rpc = Rpc(rpc_url, sleep_s=args.rpc_sleep, retries=args.rpc_retries, backoff_s=args.rpc_backoff)
+    wallet_api = None
+    if args.funding_source_method in {"wallet-api", "hybrid"}:
+        api_key = selected_helius_api_key(args, rpc_url)
+        if not api_key:
+            raise SystemExit("Helius API key missing for Wallet API; set --helius-api-key-env or use RPC URL with api-key")
+        wallet_api = WalletApi(api_key, sleep_s=args.wallet_api_sleep)
     candidates = load_candidates(args.input, args.events_input, args.limit_mints)
     wallet_classes = load_wallet_classes(args.wallet_scores)
     outcomes = load_outcomes(args.state)
@@ -587,7 +696,7 @@ def run(args):
         if args.limit_mints and processed >= args.limit_mints:
             break
         try:
-            _events, edges, signal = build_for_mint(rpc, c, args, wallet_classes, outcomes)
+            _events, edges, signal = build_for_mint(rpc, wallet_api, c, args, wallet_classes, outcomes)
             all_edges.extend(edges)
             signals.append(signal)
             processed += 1
@@ -616,6 +725,9 @@ def run(args):
         "retry_errors_total": retry_err_total,
         "retry_errors": dict(rpc.retry_errors),
         "retry_events": rpc.retry_events,
+        "funding_source_method": args.funding_source_method,
+        "wallet_api_calls": wallet_api.calls if wallet_api else 0,
+        "wallet_api_errors": dict(wallet_api.errors) if wallet_api else {},
         "terminal_error_pct": round(err_total / max(1, rpc.calls) * 100, 4),
         "dry_run": args.dry_run,
         "live_allowed": False,
@@ -645,6 +757,8 @@ def self_test():
 
     unknown_cls, *_ = classify_cluster([], [], {}, {})
     assert unknown_cls == "UNKNOWN"
+
+    assert extract_api_key_from_url("https://x/?api-key=abc") == "abc"
     print("SELF_TEST_OK")
 
 
@@ -673,6 +787,11 @@ def main():
     ap.add_argument("--rpc-sleep", type=float, default=0.0)
     ap.add_argument("--rpc-retries", type=int, default=3)
     ap.add_argument("--rpc-backoff", type=float, default=1.5)
+    ap.add_argument("--funding-source-method", choices=["gtfa", "wallet-api", "hybrid"], default="gtfa",
+                    help="Funding source backend. wallet-api costs 100 Helius credits per buyer lookup; default gtfa is cheaper.")
+    ap.add_argument("--helius-api-key-env", default="",
+                    help="Env/.env key containing Helius API key for Wallet API. If unset, derives api-key from selected RPC URL.")
+    ap.add_argument("--wallet-api-sleep", type=float, default=0.0)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()

@@ -14,11 +14,19 @@ Moduł wykrywa, czy early buyers fresh tokena wyglądają jak niezależni snajpe
 - `datasets/sniper_wallet_scores.csv` do rozpoznania znanych GOOD/FAST_DUMPER walletów.
 - `state.jsonl` do korelacji z `hard_stop`, `rug`, `dust_or_rug` i zyskownymi wynikami.
 
-Funding source V1:
+Funding source V1 default:
 
 ```text
 największy inbound SOL transfer do buyer walleta w oknie 60 min przed first buy
 ```
+
+Opcjonalnie można użyć Helius Wallet API `funded-by`:
+
+```text
+GET /v1/wallet/{wallet}/funded-by
+```
+
+To zwraca oryginalnego fundera walleta (`funder`, `amount`, `signature`, `timestamp`, `funderType`). Jest to przydatne do wykrywania “matki”, ale API jest beta i kosztuje 100 credits/call, więc nie jest defaultem. Tryb `hybrid` próbuje Wallet API najpierw, a gdy nie ma wyniku, wraca do tańszego `getTransactionsForAddress`.
 
 ## Komendy
 
@@ -47,6 +55,29 @@ python3 scripts/bundler_funding_backtest.py \
   --rpc-backoff 1.5
 ```
 
+Run z Wallet API tylko gdy świadomie akceptujesz credit cost:
+
+```bash
+python3 scripts/bundler_funding_backtest.py \
+  --rpc-env-key RPC_SEND_URL \
+  --funding-source-method hybrid \
+  --limit-mints 100 \
+  --funding-lookback-min 60 \
+  --early-window-sec 10 \
+  --rpc-sleep 0.75 \
+  --wallet-api-sleep 0.1
+```
+
+Jeśli API key nie jest w URL, podaj nazwę zmiennej z `.env` bez wpisywania sekretu w CLI:
+
+```bash
+python3 scripts/bundler_funding_backtest.py \
+  --rpc-env-key RPC_SEND_URL \
+  --funding-source-method hybrid \
+  --helius-api-key-env HELIUS_API_KEY \
+  --limit-mints 100
+```
+
 ## Outputy
 
 ```text
@@ -54,6 +85,15 @@ datasets/bundler_wallet_edges.jsonl
 datasets/bundler_clusters.csv
 datasets/fresh_bundle_risk_signals.jsonl
 datasets/bundler_funding_errors.jsonl
+```
+
+`bundler_wallet_edges.jsonl` przy trybie Wallet API dodaje pola:
+
+```text
+funding_source_method=wallet-api|gtfa|hybrid_gtfa_fallback
+wallet_api_funder_type
+wallet_api_funder_name_present
+wallet_api_within_lookback
 ```
 
 `fresh_bundle_risk_signals.jsonl` zawiera minimum:
