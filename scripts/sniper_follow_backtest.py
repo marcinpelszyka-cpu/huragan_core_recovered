@@ -271,6 +271,11 @@ def classify_wallet(sample_count, win_rate, avg_pnl_sol, fast_dump_rate, avg_hol
         return "UNKNOWN"
     if dev_suspect_rate >= 0.5 and sample_count >= 2:
         return "DEV_SNIPER_SUSPECT"
+    # This strategy is explicitly interested in profitable first-seconds flippers.
+    # They often sell quickly, so classifying every fast seller as bad hides the
+    # exact wallets we want to study.
+    if sample_count >= 2 and win_rate >= 0.5 and avg_pnl_sol > 0 and fast_dump_rate >= 0.5:
+        return "GOOD_FLIP_SNIPER"
     if fast_dump_rate >= 0.5 and sample_count >= 2:
         return "FAST_DUMPER"
     if sample_count >= 3 and win_rate >= 0.55 and avg_pnl_sol > 0 and avg_hold_ratio_60s >= 0.35:
@@ -349,30 +354,45 @@ def build_signals(events, scores, *, early_window_secs=10, min_buy_sol=0.01, min
             r for r in rows
             if r["side"] == "buy" and r["age_secs"] <= early_window_secs and r["quote_delta_sol"] >= min_buy_sol
         ]
-        good = [r for r in early_buys if class_by_wallet.get(r.get("owner") or r.get("signer"), "UNKNOWN") == "GOOD_SNIPER"]
+        good = [
+            r for r in early_buys
+            if class_by_wallet.get(r.get("owner") or r.get("signer"), "UNKNOWN") in {"GOOD_SNIPER", "GOOD_FLIP_SNIPER"}
+        ]
+        holder_good = [r for r in good if class_by_wallet.get(r.get("owner") or r.get("signer")) == "GOOD_SNIPER"]
+        flip_good = [r for r in good if class_by_wallet.get(r.get("owner") or r.get("signer")) == "GOOD_FLIP_SNIPER"]
         good_wallets = sorted({r.get("owner") or r.get("signer") for r in good if r.get("owner") or r.get("signer")})
+        flip_wallets = sorted({r.get("owner") or r.get("signer") for r in flip_good if r.get("owner") or r.get("signer")})
         total_buy = sum(r["quote_delta_sol"] for r in good)
-        bought_by_good = sum(r["token_delta_raw"] for r in good)
-        sold_by_good_10s = sum(
+        flip_buy = sum(r["quote_delta_sol"] for r in flip_good)
+        bought_by_holder_good = sum(r["token_delta_raw"] for r in holder_good)
+        holder_wallets = {r.get("owner") or r.get("signer") for r in holder_good}
+        sold_by_holder_good_10s = sum(
             r["token_delta_raw"]
             for r in rows
-            if r["side"] == "sell" and r["age_secs"] <= early_window_secs and (r.get("owner") or r.get("signer")) in set(good_wallets)
+            if r["side"] == "sell" and r["age_secs"] <= early_window_secs and (r.get("owner") or r.get("signer")) in holder_wallets
         )
-        hold_ratio = max(0.0, (bought_by_good - sold_by_good_10s) / bought_by_good) if bought_by_good else 0.0
-        passed = len(good_wallets) >= min_good_snipers and total_buy >= min_total_buy_sol and hold_ratio >= min_hold_ratio
+        hold_ratio = max(0.0, (bought_by_holder_good - sold_by_holder_good_10s) / bought_by_holder_good) if bought_by_holder_good else 0.0
+        holder_passed = len(holder_wallets) >= min_good_snipers and total_buy >= min_total_buy_sol and hold_ratio >= min_hold_ratio
+        flip_passed = len(flip_wallets) >= min_good_snipers and flip_buy >= min_total_buy_sol
+        passed = holder_passed or flip_passed
+        reason = "good_flip_snipers_follow" if flip_passed else "good_holder_snipers_follow" if holder_passed else "insufficient_good_sniper_signal"
         signals.append({
             "mint": mint,
             "signal": "FOLLOW_SHADOW" if passed else "NO_SIGNAL",
             "passed": passed,
+            "follow_style": "fast_flip" if flip_passed else "hold" if holder_passed else "none",
             "age_limit_secs": 60,
             "early_window_secs": early_window_secs,
             "target_market_cap_note": "around_3500_if_source_available_else_sol_bucket",
             "entry_market_cap_sol": next((r.get("entry_market_cap_sol", 0.0) for r in rows if r.get("entry_market_cap_sol", 0.0)), 0.0),
             "good_sniper_count": len(good_wallets),
+            "good_flip_sniper_count": len(flip_wallets),
             "good_sniper_wallets": good_wallets[:10],
+            "good_flip_sniper_wallets": flip_wallets[:10],
             "good_sniper_buy_sol": round(total_buy, 12),
+            "good_flip_sniper_buy_sol": round(flip_buy, 12),
             "good_sniper_hold_ratio_10s": round(hold_ratio, 6),
-            "reason": "good_snipers_follow" if passed else "insufficient_good_sniper_signal",
+            "reason": reason,
             "live_allowed": False,
         })
     return signals
