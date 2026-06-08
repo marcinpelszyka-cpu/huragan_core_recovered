@@ -38,6 +38,7 @@ Pełny shadow run:
 
 ```bash
 python3 scripts/bundler_funding_backtest.py \
+  --rpc-env-key RPC_SEND_URL \
   --limit-mints 500 \
   --funding-lookback-min 60 \
   --early-window-sec 10 \
@@ -100,6 +101,14 @@ top mother wallets repeat across multiple mints
 risk_score correlates with hard_stop/rug/dust outcomes
 follow_score correlates with positive 30s/60s forward outcome
 zero live trades
+```
+
+## Bezpieczne użycie RPC URL
+
+Nie przekazywać pełnego RPC URL przez `--rpc-url`, bo będzie widoczny w `ps`. Na VPS używać:
+
+```bash
+python3 scripts/bundler_funding_backtest.py --rpc-env-key RPC_SEND_URL ...
 ```
 
 ## Safety

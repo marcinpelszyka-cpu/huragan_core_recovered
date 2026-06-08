@@ -563,12 +563,19 @@ def build_for_mint(rpc, candidate, args, wallet_classes, outcomes):
     return events, edges, signal
 
 
+def selected_rpc_url(args):
+    if args.rpc_env_key:
+        return load_dotenv_value(args.rpc_env_key, "")
+    return args.rpc_url
+
+
 def run(args):
-    if args.dry_run and not args.rpc_url:
+    rpc_url = selected_rpc_url(args)
+    if args.dry_run and not rpc_url:
         return {"dry_run": True, "rpc_missing": True, "processed_mints": 0, "live_allowed": False}
-    if not args.rpc_url:
-        raise SystemExit("RPC_URL missing; pass --rpc-url or source .env")
-    rpc = Rpc(args.rpc_url, sleep_s=args.rpc_sleep, retries=args.rpc_retries, backoff_s=args.rpc_backoff)
+    if not rpc_url:
+        raise SystemExit("RPC_URL missing; pass --rpc-url, --rpc-env-key, or source .env")
+    rpc = Rpc(rpc_url, sleep_s=args.rpc_sleep, retries=args.rpc_retries, backoff_s=args.rpc_backoff)
     candidates = load_candidates(args.input, args.events_input, args.limit_mints)
     wallet_classes = load_wallet_classes(args.wallet_scores)
     outcomes = load_outcomes(args.state)
@@ -648,6 +655,7 @@ def main():
     ap.add_argument("--wallet-scores", default="datasets/sniper_wallet_scores.csv")
     ap.add_argument("--state", default="state.jsonl")
     ap.add_argument("--rpc-url", default=load_dotenv_value("RPC_URL", ""))
+    ap.add_argument("--rpc-env-key", default="", help="Read RPC URL from .env key, e.g. RPC_SEND_URL; avoids exposing URL in ps args")
     ap.add_argument("--out-edges", default=DEFAULT_OUT_EDGES)
     ap.add_argument("--out-clusters", default=DEFAULT_OUT_CLUSTERS)
     ap.add_argument("--out-signals", default=DEFAULT_OUT_SIGNALS)
