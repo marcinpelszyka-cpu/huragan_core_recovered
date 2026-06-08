@@ -15,6 +15,7 @@ mod strategy;
 use crate::engine::{MigrationTarget, QuoteAsset};
 use crate::executor::TxTerminalStatus;
 use crate::state::{LedgerManager, PositionState};
+use chrono::Utc;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::signature::Keypair;
 use std::env;
@@ -431,7 +432,29 @@ async fn main() -> anyhow::Result<()> {
                             if slippage_rebuilds >= 2 {
                                 // Diagnostic: 3rd attempt with skip_preflight to test if RPC sim
                                 // is false-rejecting or pool genuinely blocks the tx.
+                                let diag_guard = check_diagnostic_guard(&ledger, &target.mint);
+                                if !diag_guard.allowed {
+                                    let reason = diag_guard.reason.clone();
+                                    let state = live_position_state(
+                                        &live_variant,
+                                        &target,
+                                        &submitted_plan,
+                                        &gate,
+                                        "live_failed",
+                                        String::new(),
+                                        &reason,
+                                    );
+                                    if let Err(save_err) = ledger.save_new_position(&state) {
+                                        eprintln!("⚠️ DIAG LIMIT STATE SAVE FAILED: {save_err}");
+                                    }
+                                    break Err(anyhow::anyhow!("{reason}"));
+                                }
+                                println!(
+                                    "🧪 ONCHAIN_DIAGNOSTIC_TEST: {} | skip_preflight=true reason=double_preflight_6004",
+                                    target.mint
+                                );
                                 let skip = executor.send_skip_preflight(payer_ref, &submitted_plan.instructions).await;
+                                record_diagnostic_attempt(&ledger, &target.mint, skip.is_ok());
                                 match skip {
                                     Ok(sig) => {
                                         println!(
@@ -783,6 +806,107 @@ fn is_live_buy_exceeded_slippage_error(error: &str) -> bool {
         || normalized.contains("custom:6004")
         || normalized.contains("custom(6004)")
         || normalized.contains("custom\\\":6004")
+}
+
+struct DiagnosticGuard {
+    allowed: bool,
+    reason: String,
+}
+
+fn check_diagnostic_guard(_ledger: &LedgerManager, mint: &str) -> DiagnosticGuard {
+    if !env_bool("LIVE_ONCHAIN_DIAGNOSTIC_ENABLED", false) {
+        return DiagnosticGuard {
+            allowed: false,
+            reason: "diagnostic_disabled".into(),
+        };
+    }
+    let max_per_day = env_u64("LIVE_ONCHAIN_DIAGNOSTIC_MAX_PER_DAY", 2);
+    let today = chrono::Utc::now().format("%Y%m%d").to_string();
+    let key = format!("DIAGNOSTIC_COUNT_{today}");
+    // Atomic diagnostic counter via state.jsonl helper entries
+    let count = count_diagnostic_attempts_today(_ledger, &today);
+    if count >= max_per_day {
+        return DiagnosticGuard {
+            allowed: false,
+            reason: format!("diagnostic_daily_limit_reached:count={count} max={max_per_day}"),
+        };
+    }
+    // Per-pool check: already tested this mint in diagnostic mode today
+    if mint_already_tested(_ledger, mint, &today) {
+        return DiagnosticGuard {
+            allowed: false,
+            reason: format!("diagnostic_pool_already_tested:mint={mint}"),
+        };
+    }
+    DiagnosticGuard {
+        allowed: true,
+        reason: "diagnostic_allowed".into(),
+    }
+}
+
+fn count_diagnostic_attempts_today(_ledger: &LedgerManager, today: &str) -> u64 {
+    // Count diagnostic-labeled rows in state.jsonl for today via timestamp in tx
+    // For simplicity: count live_failed with exit_reason containing "onchain_diag" 
+    // or "POOL_LEVEL_REJECTED" or "RPC_PREFLIGHT_FALSE_REJECTION"
+    // This is a lightweight approach — no new file.
+    let path = std::path::Path::new("state.jsonl");
+    let today_prefix = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let mut count = 0u64;
+    if let Ok(content) = std::fs::read_to_string(path) {
+        for line in content.lines().rev().take(2000) {
+            if !line.contains(&today_prefix) {
+                continue;
+            }
+            let lower = line.to_lowercase();
+            if lower.contains("onchain_diagnostic")
+                || lower.contains("pool_level_rejected")
+                || lower.contains("rpc_preflight_false_rejection")
+            {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+fn mint_already_tested(_ledger: &LedgerManager, mint: &str, today: &str) -> bool {
+    let path = std::path::Path::new("state.jsonl");
+    let today_prefix = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    if let Ok(content) = std::fs::read_to_string(path) {
+        for line in content.lines().rev().take(2000) {
+            if !line.contains(&today_prefix) {
+                continue;
+            }
+            if line.contains(mint)
+                && (line.contains("ONCHAIN_DIAGNOSTIC")
+                    || line.contains("onchain_diagnostic")
+                    || line.contains("POOL_LEVEL_REJECTED")
+                    || line.contains("RPC_PREFLIGHT_FALSE_REJECTION"))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn record_diagnostic_attempt(ledger: &LedgerManager, mint: &str, passed: bool) {
+    let diagnostic_label = if passed {
+        "RPC_PREFLIGHT_FALSE_REJECTION"
+    } else {
+        "POOL_LEVEL_REJECTED"
+    };
+    let state = PositionState {
+        variant_id: "Z3".into(),
+        mint: mint.into(),
+        status: if passed { "holding" } else { "live_failed" }.into(),
+        exit_reason: format!("onchain_diagnostic_test:diagnostic_label={}", diagnostic_label),
+        excluded_from_stats: !passed,
+        ..Default::default()
+    };
+    if let Err(e) = ledger.save_new_position(&state) {
+        eprintln!("⚠️ DIAGNOSTIC RECORD SAVE FAILED for {mint}: {e}");
+    }
 }
 
 fn sanitize_live_error(error: &str) -> String {
