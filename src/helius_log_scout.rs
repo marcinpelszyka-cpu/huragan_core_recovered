@@ -129,8 +129,9 @@ pub async fn run_helius_log_scout(tx: mpsc::Sender<MigrationTarget>) -> anyhow::
                     eprintln!("helius reconnect: backing off {reconnect_delay_secs}s: {e}");
                 }
                 sleep(Duration::from_secs(reconnect_delay_secs)).await;
-                reconnect_delay_secs =
-                    reconnect_delay_secs.saturating_mul(2).min(reconnect_max_secs);
+                reconnect_delay_secs = reconnect_delay_secs
+                    .saturating_mul(2)
+                    .min(reconnect_max_secs);
                 continue;
             }
         }
@@ -236,11 +237,7 @@ async fn fetch_transaction(
             }
         ]
     });
-    let response = client
-        .post(rpc_url)
-        .json(&body)
-        .send()
-        .await?;
+    let response = client.post(rpc_url).json(&body).send().await?;
     let status = response.status();
     if status.as_u16() == 429 {
         anyhow::bail!("rpc_rate_limited:http_429");

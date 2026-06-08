@@ -324,22 +324,112 @@ async fn main() -> anyhow::Result<()> {
                     stability.max_buy_quote_drop_bps
                 );
 
+                // The anti-rug gate intentionally waits ~2s and samples reserves.
+                // That makes the original buy plan stale in fast pools: min_out can be
+                // based on a quote from before the gate and fail with ExceededSlippage
+                // at RPC preflight. Rebuild and re-simulate immediately after the gate,
+                // then submit only the fresh transaction.
+                let fresh_plan = match engine::process_migration_and_build_amm_ixs(
+                    &rpc,
+                    &target,
+                    buy_lamports,
+                    payer.as_ref(),
+                    true,
+                )
+                .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let reason = sanitize_live_error(&format!("live_entry_rebuild_failed:{e}"));
+                        let mut state = live_position_state(
+                            &live_variant,
+                            &target,
+                            &plan,
+                            &gate,
+                            "live_failed",
+                            String::new(),
+                            &reason,
+                        );
+                        apply_live_entry_stability_state(&mut state, &stability);
+                        if let Err(save_err) = ledger.save_new_position(&state) {
+                            eprintln!(
+                                "⚠️ LIVE ENTRY REBUILD STATE SAVE FAILED for {}: {save_err}",
+                                target.mint
+                            );
+                        }
+                        println!(
+                            "⛔ LIVE ENTRY REBUILD FAILED: {} | reason={}",
+                            target.mint, reason
+                        );
+                        notifier::send_telegram_alert(format!(
+                            "⛔ HURAGAN LIVE ENTRY REBUILD FAILED\nmint={}\nreason={}",
+                            target.mint, reason
+                        ))
+                        .await;
+                        trades_seen += 1;
+                        if trades_seen >= max_trades {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                if !fresh_plan.simulation_ok {
+                    let reason = "live_entry_rebuild_preflight_failed".to_string();
+                    let mut state = live_position_state(
+                        &live_variant,
+                        &target,
+                        &fresh_plan,
+                        &gate,
+                        "live_failed",
+                        String::new(),
+                        &reason,
+                    );
+                    apply_live_entry_stability_state(&mut state, &stability);
+                    if let Err(save_err) = ledger.save_new_position(&state) {
+                        eprintln!(
+                            "⚠️ LIVE ENTRY REBUILD PREFLIGHT STATE SAVE FAILED for {}: {save_err}",
+                            target.mint
+                        );
+                    }
+                    println!(
+                        "⛔ LIVE ENTRY REBUILD PREFLIGHT FAILED: {} | expected={} min={}",
+                        target.mint, fresh_plan.expected_tokens_out, fresh_plan.min_tokens_out
+                    );
+                    notifier::send_telegram_alert(format!(
+                        "⛔ HURAGAN LIVE ENTRY REBUILD PREFLIGHT FAILED\nmint={}\nexpected={}\nmin={}",
+                        target.mint, fresh_plan.expected_tokens_out, fresh_plan.min_tokens_out
+                    ))
+                    .await;
+                    trades_seen += 1;
+                    if trades_seen >= max_trades {
+                        break;
+                    }
+                    continue;
+                }
+                println!(
+                    "🔁 LIVE ENTRY REBUILT: {} | old_expected={} fresh_expected={} fresh_min={}",
+                    target.mint,
+                    plan.expected_tokens_out,
+                    fresh_plan.expected_tokens_out,
+                    fresh_plan.min_tokens_out
+                );
+
                 let executor = executor::Executor::new(rpc_url.clone());
                 match executor
-                    .send_with_preflight(payer_ref, &plan.instructions)
+                    .send_with_preflight(payer_ref, &fresh_plan.instructions)
                     .await
                 {
                     Ok(sig) => {
                         println!(
                             "🚀 LIVE SUBMITTED: {} | sig={} tokens={}",
-                            target.mint, sig, plan.expected_tokens_out
+                            target.mint, sig, fresh_plan.expected_tokens_out
                         );
                         match executor.wait_terminal_status(&sig, 10).await? {
                             TxTerminalStatus::Confirmed => {
                                 let mut state = live_position_state(
                                     &live_variant,
                                     &target,
-                                    &plan,
+                                    &fresh_plan,
                                     &gate,
                                     "holding",
                                     sig.to_string(),
@@ -354,7 +444,7 @@ async fn main() -> anyhow::Result<()> {
                                 }
                                 println!(
                                     "✅ LIVE CONFIRMED: {} | sig={} tokens={}",
-                                    target.mint, sig, plan.expected_tokens_out
+                                    target.mint, sig, fresh_plan.expected_tokens_out
                                 );
                                 println!("📝 LIVE POSITION SAVED: {} holding", target.mint);
                                 notifier::send_telegram_alert(format!(
@@ -366,8 +456,8 @@ cost_sol={:.9}
 auto_sell={}",
                                     target.mint,
                                     sig,
-                                    plan.expected_tokens_out,
-                                    plan.spend_lamports as f64 / 1e9,
+                                    fresh_plan.expected_tokens_out,
+                                    fresh_plan.spend_lamports as f64 / 1e9,
                                     env_bool("LIVE_AUTO_SELL_ENABLED", false)
                                 ))
                                 .await;
@@ -390,7 +480,7 @@ auto_sell={}",
                                 let state = live_position_state(
                                     &live_variant,
                                     &target,
-                                    &plan,
+                                    &fresh_plan,
                                     &gate,
                                     "live_failed",
                                     sig.to_string(),
@@ -422,7 +512,7 @@ reason={}",
                                 let state = live_position_state(
                                     &live_variant,
                                     &target,
-                                    &plan,
+                                    &fresh_plan,
                                     &gate,
                                     "live_failed",
                                     sig.to_string(),
@@ -454,7 +544,7 @@ reason={}",
                         let state = live_position_state(
                             &live_variant,
                             &target,
-                            &plan,
+                            &fresh_plan,
                             &gate,
                             "live_failed",
                             String::new(),
@@ -605,7 +695,9 @@ fn apply_live_entry_stability_state(
     } else if stability.min_quote_reserve_raw == 0 {
         state.min_quote_reserve_raw
     } else {
-        state.min_quote_reserve_raw.min(stability.min_quote_reserve_raw)
+        state
+            .min_quote_reserve_raw
+            .min(stability.min_quote_reserve_raw)
     };
     state.quote_reserve_raw = stability
         .samples
