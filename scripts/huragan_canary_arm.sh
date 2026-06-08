@@ -75,6 +75,8 @@ Environment=EMERGENCY_JITO_TIP_LAMPORTS=0
 Environment=AMM_MIN_POOL_SOL_FOR_ENTRY_LAMPORTS=2000000000
 Environment=LIVE_SEND_BACKEND=rpc
 Environment=LIVE_SEND_PREFLIGHT_COMMITMENT=processed
+Environment=LIVE_ONCHAIN_DIAGNOSTIC_ENABLED=true
+Environment=LIVE_ONCHAIN_DIAGNOSTIC_MAX_PER_DAY=2
 EOF
 systemctl daemon-reload
 systemctl reset-failed migration-sniper.service || true
