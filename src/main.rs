@@ -9,6 +9,7 @@ mod notifier;
 mod paper_amm;
 mod position_manager;
 mod scout;
+mod sniper_shadow;
 mod state;
 mod strategy;
 
