@@ -138,6 +138,10 @@ pub struct PositionState {
     #[serde(default)]
     pub live_sell_family: String,
     #[serde(default)]
+    pub diagnostic_label: String,
+    #[serde(default)]
+    pub diagnostic_day: String,
+    #[serde(default)]
     pub excluded_from_stats: bool,
     #[serde(default)]
     pub exited_early_no_momentum: bool,
@@ -199,6 +203,25 @@ impl LedgerManager {
             }
         }
         Ok(latest)
+    }
+
+    pub fn read_all(&self) -> anyhow::Result<Vec<PositionState>> {
+        let mut rows = Vec::new();
+        if !self.file_path.exists() {
+            return Ok(rows);
+        }
+        for line in BufReader::new(File::open(&self.file_path)?)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(state) = serde_json::from_str::<PositionState>(&line) {
+                rows.push(state);
+            }
+        }
+        Ok(rows)
     }
 
     pub fn get_latest_by_mint_variant(

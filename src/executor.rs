@@ -113,21 +113,38 @@ impl Executor {
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("send_with_preflight_failed")))
     }
 
-    #[allow(dead_code)]
-    pub async fn send_skip_preflight(
+    pub async fn send_onchain_diagnostic_skip_preflight(
         &self,
         payer: &Keypair,
         ixs: &[Instruction],
+        reason: &str,
     ) -> anyhow::Result<Signature> {
-        let bh = self.rpc.get_latest_blockhash().await?;
+        if self.backend != LiveSendBackend::Rpc {
+            anyhow::bail!(
+                "LIVE SEND BACKEND unsupported for diagnostic in this build: {}",
+                self.backend.as_str()
+            );
+        }
+        let (bh, _last_valid_block_height) = self
+            .rpc
+            .get_latest_blockhash_with_commitment(self.preflight_commitment)
+            .await?;
         let mut tx = Transaction::new_with_payer(ixs, Some(&payer.pubkey()));
         tx.sign(&[payer], bh);
+        println!(
+            "🧪 ONCHAIN_DIAGNOSTIC_TEST backend={} commitment={} skip_preflight=true reason={}",
+            self.backend.as_str(),
+            commitment_label(self.preflight_commitment_level),
+            reason
+        );
         let sig = self
             .rpc
             .send_transaction_with_config(
                 &tx,
                 RpcSendTransactionConfig {
                     skip_preflight: true,
+                    preflight_commitment: Some(self.preflight_commitment_level),
+                    max_retries: Some(live_send_rpc_max_retries()),
                     ..RpcSendTransactionConfig::default()
                 },
             )
@@ -272,6 +289,15 @@ fn live_send_preflight_attempts() -> u64 {
         .clamp(1, 3)
 }
 
+pub fn is_preflight_6004_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("custom(6004)")
+        || lower.contains("custom\":6004")
+        || lower.contains("custom:6004")
+        || lower.contains("exceededslippage")
+        || lower.contains("6004") && lower.contains("instructionerror")
+}
+
 fn is_retryable_blockhash_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     lower.contains("blockhashnotfound")
@@ -284,10 +310,11 @@ fn is_retryable_blockhash_error(error: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        commitment_label, is_retryable_blockhash_error, live_send_backend_from_env_value,
-        live_send_preflight_attempts, live_send_preflight_commitment_level_from_env_value,
-        live_send_rpc_max_retries, live_send_rpc_url_from_env_value,
-        tx_terminal_status_from_optional_error, LiveSendBackend, TxTerminalStatus,
+        commitment_label, is_preflight_6004_error, is_retryable_blockhash_error,
+        live_send_backend_from_env_value, live_send_preflight_attempts,
+        live_send_preflight_commitment_level_from_env_value, live_send_rpc_max_retries,
+        live_send_rpc_url_from_env_value, tx_terminal_status_from_optional_error, LiveSendBackend,
+        TxTerminalStatus,
     };
     use solana_sdk::commitment_config::CommitmentLevel;
     use std::sync::Mutex;
@@ -305,6 +332,18 @@ mod tests {
             Some(TxTerminalStatus::Failed("InstructionError".into()))
         );
         assert_eq!(tx_terminal_status_from_optional_error(None), None);
+    }
+
+    #[test]
+    fn preflight_6004_errors_are_detected() {
+        assert!(is_preflight_6004_error(
+            r#"RPC response error -32002: Transaction simulation failed: {"InstructionError":[3,{"Custom":6004}]}"#
+        ));
+        assert!(is_preflight_6004_error("InstructionError(3, Custom(6004))"));
+        assert!(is_preflight_6004_error("ExceededSlippage(6004)"));
+        assert!(!is_preflight_6004_error(
+            "InstructionError(3, Custom(6001))"
+        ));
     }
 
     #[test]

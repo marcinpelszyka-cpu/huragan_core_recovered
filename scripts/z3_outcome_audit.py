@@ -207,6 +207,15 @@ def live_outcome_category(r):
     status = r.get("status", "")
     reason = r.get("exit_reason", "") or r.get("live_exit_reason", "")
     pnl = fnum(r.get("realized_pnl_sol") or r.get("net_pnl_sol"))
+    label = r.get("diagnostic_label", "")
+    if label == "RPC_PREFLIGHT_FALSE_REJECTION":
+        return "rpc_preflight_false_rejection"
+    if label == "POOL_LEVEL_REJECTED":
+        return "pool_level_rejected"
+    if label == "ONCHAIN_DIAGNOSTIC_TEST":
+        return "diagnostic_onchain_test"
+    if reason.startswith("diagnostic_daily_limit_reached"):
+        return "diagnostic_daily_limit_reached"
     if status == "completed":
         return "completed_profit" if pnl > 0 else "completed_loss"
     if status == "live_failed" and reason.startswith("live_entry_"):
@@ -285,7 +294,7 @@ def write_report(path: Path, metrics, bands, canaries, blockers, state_path):
         else:
             counts = Counter(r.get("outcome_category", "unknown") for r in canaries)
             f.write("Outcome counts:\n")
-            for key in ["completed_profit", "completed_loss", "live_failed_entry_gate", "unrecoverable_dust_or_rug", "live_failed", "live_sell_failed_retryable"]:
+            for key in ["completed_profit", "completed_loss", "live_failed_entry_gate", "diagnostic_onchain_test", "rpc_preflight_false_rejection", "pool_level_rejected", "diagnostic_daily_limit_reached", "unrecoverable_dust_or_rug", "live_failed", "live_sell_failed_retryable"]:
                 if counts.get(key):
                     f.write(f"- {key}: {counts[key]}\n")
             f.write("\n| Mint | Category | Status | Exit | Hold s | PnL SOL | PnL % | Remaining | Sell tx |\n")

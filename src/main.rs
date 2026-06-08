@@ -17,7 +17,7 @@ use crate::executor::TxTerminalStatus;
 use crate::state::{LedgerManager, PositionState};
 use chrono::Utc;
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::signature::Keypair;
+use solana_sdk::signature::{Keypair, Signature};
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -416,249 +416,21 @@ async fn main() -> anyhow::Result<()> {
                 );
 
                 let executor = executor::Executor::new(rpc_url.clone());
-                let mut submitted_plan = fresh_plan.clone();
-                let mut slippage_rebuilds = 0u64;
-                let send_result = loop {
-                    match executor
-                        .send_with_preflight(payer_ref, &submitted_plan.instructions)
-                        .await
-                    {
-                        Ok(sig) => break Ok(sig),
-                        Err(e) => {
-                            let raw_error = e.to_string();
-                            if !is_live_buy_exceeded_slippage_error(&raw_error) {
-                                break Err(anyhow::anyhow!(raw_error));
-                            }
-                            if slippage_rebuilds >= 2 {
-                                // Diagnostic: 3rd attempt with skip_preflight to test if RPC sim
-                                // is false-rejecting or pool genuinely blocks the tx.
-                                let diag_guard = check_diagnostic_guard(&ledger, &target.mint);
-                                if !diag_guard.allowed {
-                                    let reason = diag_guard.reason.clone();
-                                    let state = live_position_state(
-                                        &live_variant,
-                                        &target,
-                                        &submitted_plan,
-                                        &gate,
-                                        "live_failed",
-                                        String::new(),
-                                        &reason,
-                                    );
-                                    if let Err(save_err) = ledger.save_new_position(&state) {
-                                        eprintln!("⚠️ DIAG LIMIT STATE SAVE FAILED: {save_err}");
-                                    }
-                                    break Err(anyhow::anyhow!("{reason}"));
-                                }
-                                println!(
-                                    "🧪 ONCHAIN_DIAGNOSTIC_TEST: {} | skip_preflight=true reason=double_preflight_6004",
-                                    target.mint
-                                );
-                                let skip = executor.send_skip_preflight(payer_ref, &submitted_plan.instructions).await;
-                                record_diagnostic_attempt(&ledger, &target.mint, skip.is_ok());
-                                match skip {
-                                    Ok(sig) => {
-                                        println!(
-                                            "🧪 ONCHAIN_DIAGNOSTIC_TEST PASSED: {} | sig={} → RPC_PREFLIGHT_FALSE_REJECTION",
-                                            target.mint, sig
-                                        );
-                                        break Ok(sig);
-                                    }
-                                    Err(skip_err) => {
-                                        break Err(anyhow::anyhow!(
-                                            "POOL_LEVEL_REJECTED:{} mint={} onchain_skip_preflight_error={}",
-                                            raw_error, target.mint, skip_err
-                                        ));
-                                    }
-                                }
-                            }
-                            slippage_rebuilds += 1;
-                            println!(
-                                "🔁 LIVE SEND SLIPPAGE REBUILD: {} | attempt={} reason=ExceededSlippage",
-                                target.mint, slippage_rebuilds
-                            );
-                            let retry_plan = match engine::process_migration_and_build_amm_ixs(
-                                &rpc,
-                                &target,
-                                buy_lamports,
-                                payer.as_ref(),
-                                true,
-                            )
-                            .await
-                            {
-                                Ok(p) if p.simulation_ok => p,
-                                Ok(p) => {
-                                    break Err(anyhow::anyhow!(
-                                        "live_send_slippage_rebuild_preflight_failed:expected={} min={}",
-                                        p.expected_tokens_out,
-                                        p.min_tokens_out
-                                    ));
-                                }
-                                Err(rebuild_err) => {
-                                    break Err(anyhow::anyhow!(
-                                        "live_send_slippage_rebuild_failed:{rebuild_err}"
-                                    ));
-                                }
-                            };
-                            println!(
-                                "🔁 LIVE SEND REBUILT: {} | prev_expected={} fresh_expected={} fresh_min={}",
-                                target.mint,
-                                submitted_plan.expected_tokens_out,
-                                retry_plan.expected_tokens_out,
-                                retry_plan.min_tokens_out
-                            );
-                            submitted_plan = retry_plan;
-                        }
-                    }
-                };
-                match send_result {
-                    Ok(sig) => {
-                        println!(
-                            "🚀 LIVE SUBMITTED: {} | sig={} tokens={}",
-                            target.mint, sig, submitted_plan.expected_tokens_out
-                        );
-                        match executor.wait_terminal_status(&sig, 10).await? {
-                            TxTerminalStatus::Confirmed => {
-                                let mut state = live_position_state(
-                                    &live_variant,
-                                    &target,
-                                    &submitted_plan,
-                                    &gate,
-                                    "holding",
-                                    sig.to_string(),
-                                    "",
-                                );
-                                apply_live_entry_stability_state(&mut state, &stability);
-                                if let Err(e) = ledger.save_new_position(&state) {
-                                    eprintln!(
-                                        "⚠️ LIVE STATE SAVE FAILED for {} sig={}: {e}",
-                                        target.mint, sig
-                                    );
-                                }
-                                println!(
-                                    "✅ LIVE CONFIRMED: {} | sig={} tokens={}",
-                                    target.mint, sig, submitted_plan.expected_tokens_out
-                                );
-                                println!("📝 LIVE POSITION SAVED: {} holding", target.mint);
-                                notifier::send_telegram_alert(format!(
-                                    "✅ HURAGAN Z3 BUY CONFIRMED
-mint={}
-buy_sig={}
-tokens={}
-cost_sol={:.9}
-auto_sell={}",
-                                    target.mint,
-                                    sig,
-                                    submitted_plan.expected_tokens_out,
-                                    submitted_plan.spend_lamports as f64 / 1e9,
-                                    env_bool("LIVE_AUTO_SELL_ENABLED", false)
-                                ))
-                                .await;
-                                if env_bool("LIVE_AUTO_SELL_ENABLED", false) {
-                                    let mut live_state = state;
-                                    run_z3_live_auto_sell_monitor(
-                                        &rpc,
-                                        &executor,
-                                        &ledger,
-                                        &target,
-                                        &mut live_state,
-                                        payer_ref,
-                                    )
-                                    .await?;
-                                }
-                            }
-                            TxTerminalStatus::Failed(err) => {
-                                let reason =
-                                    sanitize_live_error(&format!("transaction_failed:{err}"));
-                                let state = live_position_state(
-                                    &live_variant,
-                                    &target,
-                                    &submitted_plan,
-                                    &gate,
-                                    "live_failed",
-                                    sig.to_string(),
-                                    &reason,
-                                );
-                                if let Err(save_err) = ledger.save_new_position(&state) {
-                                    eprintln!(
-                                        "⚠️ LIVE FAILED STATE SAVE FAILED for {} sig={}: {save_err}",
-                                        target.mint, sig
-                                    );
-                                }
-                                println!(
-                                    "❌ LIVE FAILED: {} | sig={} reason={}",
-                                    target.mint, sig, reason
-                                );
-                                notifier::send_telegram_alert(format!(
-                                    "❌ HURAGAN LIVE FAILED
-mint={}
-sig={}
-reason={}",
-                                    target.mint, sig, reason
-                                ))
-                                .await;
-                            }
-                            TxTerminalStatus::TimeoutUnknown => {
-                                let reason = sanitize_live_error(&format!(
-                                    "confirmation_timeout_unknown:{sig}"
-                                ));
-                                let state = live_position_state(
-                                    &live_variant,
-                                    &target,
-                                    &submitted_plan,
-                                    &gate,
-                                    "live_failed",
-                                    sig.to_string(),
-                                    &reason,
-                                );
-                                if let Err(save_err) = ledger.save_new_position(&state) {
-                                    eprintln!(
-                                        "⚠️ LIVE FAILED STATE SAVE FAILED for {} sig={}: {save_err}",
-                                        target.mint, sig
-                                    );
-                                }
-                                println!(
-                                    "❌ LIVE FAILED: {} | sig={} reason={}",
-                                    target.mint, sig, reason
-                                );
-                                notifier::send_telegram_alert(format!(
-                                    "❌ HURAGAN LIVE FAILED
-mint={}
-sig={}
-reason={}",
-                                    target.mint, sig, reason
-                                ))
-                                .await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let reason = sanitize_live_error(&e.to_string());
-                        let state = live_position_state(
-                            &live_variant,
-                            &target,
-                            &submitted_plan,
-                            &gate,
-                            "live_failed",
-                            String::new(),
-                            &reason,
-                        );
-                        if let Err(save_err) = ledger.save_new_position(&state) {
-                            eprintln!(
-                                "⚠️ LIVE FAILED STATE SAVE FAILED for {}: {save_err}",
-                                target.mint
-                            );
-                        }
-                        println!(
-                            "❌ LIVE FAILED: {} | sig=<none> reason={}",
-                            target.mint, reason
-                        );
-                        notifier::send_telegram_alert(format!(
-                            "❌ HURAGAN LIVE FAILED\nmint={}\nsig=<none>\nreason={}",
-                            target.mint, reason
-                        ))
-                        .await;
-                    }
-                }
+
+                submit_live_buy_with_optional_diagnostic(
+                    &rpc,
+                    &executor,
+                    &ledger,
+                    &target,
+                    &fresh_plan,
+                    &gate,
+                    &stability,
+                    payer_ref,
+                    &live_variant,
+                    buy_lamports,
+                )
+                .await?;
+
                 // A real-send attempt consumes the canary slot regardless of success/failure.
                 // This prevents systemd/on-failure loops from submitting another canary.
                 trades_seen += 1;
@@ -683,6 +455,428 @@ reason={}",
     }
 
     Ok(())
+}
+
+async fn submit_live_buy_with_optional_diagnostic(
+    rpc: &RpcClient,
+    executor: &executor::Executor,
+    ledger: &LedgerManager,
+    target: &MigrationTarget,
+    fresh_plan: &engine::BuiltBuyPlan,
+    gate: &engine::AdvancedGateDecision,
+    stability: &engine::LiveEntryStabilityDecision,
+    payer_ref: &Keypair,
+    live_variant: &str,
+    buy_lamports: u64,
+) -> anyhow::Result<()> {
+    match executor
+        .send_with_preflight(payer_ref, &fresh_plan.instructions)
+        .await
+    {
+        Ok(sig) => {
+            handle_live_buy_signature(
+                rpc,
+                executor,
+                ledger,
+                target,
+                fresh_plan,
+                gate,
+                stability,
+                payer_ref,
+                live_variant,
+                sig,
+                false,
+            )
+            .await?;
+        }
+        Err(first_err) => {
+            let first_err_text = first_err.to_string();
+            if !executor::is_preflight_6004_error(&first_err_text) {
+                save_live_failed(
+                    ledger,
+                    live_variant,
+                    target,
+                    fresh_plan,
+                    gate,
+                    stability,
+                    String::new(),
+                    &first_err_text,
+                    "",
+                );
+                return Ok(());
+            }
+
+            println!(
+                "⚠️ LIVE PREFLIGHT 6004: {} | rebuilding once before diagnostic",
+                target.mint
+            );
+            let second_plan = match engine::process_migration_and_build_amm_ixs(
+                rpc,
+                target,
+                buy_lamports,
+                Some(payer_ref),
+                false,
+            )
+            .await
+            {
+                Ok(plan) => plan,
+                Err(e) => {
+                    save_live_failed(
+                        ledger,
+                        live_variant,
+                        target,
+                        fresh_plan,
+                        gate,
+                        stability,
+                        String::new(),
+                        &format!("live_entry_second_rebuild_failed:{e}"),
+                        "",
+                    );
+                    return Ok(());
+                }
+            };
+            println!(
+                "🔁 LIVE ENTRY REBUILT SECOND: {} | previous_expected={} second_expected={} second_min={}",
+                target.mint,
+                fresh_plan.expected_tokens_out,
+                second_plan.expected_tokens_out,
+                second_plan.min_tokens_out
+            );
+
+            match executor
+                .send_with_preflight(payer_ref, &second_plan.instructions)
+                .await
+            {
+                Ok(sig) => {
+                    handle_live_buy_signature(
+                        rpc,
+                        executor,
+                        ledger,
+                        target,
+                        &second_plan,
+                        gate,
+                        stability,
+                        payer_ref,
+                        live_variant,
+                        sig,
+                        false,
+                    )
+                    .await?;
+                }
+                Err(second_err) => {
+                    let second_err_text = second_err.to_string();
+                    if !executor::is_preflight_6004_error(&second_err_text) {
+                        save_live_failed(
+                            ledger,
+                            live_variant,
+                            target,
+                            &second_plan,
+                            gate,
+                            stability,
+                            String::new(),
+                            &second_err_text,
+                            "",
+                        );
+                        return Ok(());
+                    }
+
+                    if let Err(reason) = validate_onchain_diagnostic_allowed(ledger, target) {
+                        let label = if reason == "diagnostic_daily_limit_reached" {
+                            "diagnostic_daily_limit_reached"
+                        } else {
+                            ""
+                        };
+                        save_live_failed(
+                            ledger,
+                            live_variant,
+                            target,
+                            &second_plan,
+                            gate,
+                            stability,
+                            String::new(),
+                            &reason,
+                            label,
+                        );
+                        return Ok(());
+                    }
+
+                    println!(
+                        "🧪 ONCHAIN_DIAGNOSTIC_TEST QUALIFIED: {} | reason=double_preflight_6004",
+                        target.mint
+                    );
+                    match executor
+                        .send_onchain_diagnostic_skip_preflight(
+                            payer_ref,
+                            &second_plan.instructions,
+                            "double_preflight_6004",
+                        )
+                        .await
+                    {
+                        Ok(sig) => {
+                            handle_live_buy_signature(
+                                rpc,
+                                executor,
+                                ledger,
+                                target,
+                                &second_plan,
+                                gate,
+                                stability,
+                                payer_ref,
+                                live_variant,
+                                sig,
+                                true,
+                            )
+                            .await?;
+                        }
+                        Err(e) => {
+                            save_live_failed(
+                                ledger,
+                                live_variant,
+                                target,
+                                &second_plan,
+                                gate,
+                                stability,
+                                String::new(),
+                                &format!("pool_level_rejected:{e}"),
+                                "POOL_LEVEL_REJECTED",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_live_buy_signature(
+    rpc: &RpcClient,
+    executor: &executor::Executor,
+    ledger: &LedgerManager,
+    target: &MigrationTarget,
+    plan: &engine::BuiltBuyPlan,
+    gate: &engine::AdvancedGateDecision,
+    stability: &engine::LiveEntryStabilityDecision,
+    payer_ref: &Keypair,
+    live_variant: &str,
+    sig: Signature,
+    diagnostic: bool,
+) -> anyhow::Result<()> {
+    println!(
+        "🚀 LIVE SUBMITTED: {} | sig={} tokens={} diagnostic={}",
+        target.mint, sig, plan.expected_tokens_out, diagnostic
+    );
+    match executor.wait_terminal_status(&sig, 10).await? {
+        TxTerminalStatus::Confirmed => {
+            let exit_reason = if diagnostic {
+                "rpc_preflight_false_rejection"
+            } else {
+                ""
+            };
+            let mut state = live_position_state(
+                live_variant,
+                target,
+                plan,
+                gate,
+                "holding",
+                sig.to_string(),
+                exit_reason,
+            );
+            apply_live_entry_stability_state(&mut state, stability);
+            if diagnostic {
+                mark_diagnostic(&mut state, "RPC_PREFLIGHT_FALSE_REJECTION");
+            }
+            if let Err(e) = ledger.save_new_position(&state) {
+                eprintln!(
+                    "⚠️ LIVE STATE SAVE FAILED for {} sig={}: {e}",
+                    target.mint, sig
+                );
+            }
+            println!(
+                "✅ LIVE CONFIRMED: {} | sig={} tokens={} diagnostic={}",
+                target.mint, sig, plan.expected_tokens_out, diagnostic
+            );
+            println!("📝 LIVE POSITION SAVED: {} holding", target.mint);
+            notifier::send_telegram_alert(format!(
+                "✅ HURAGAN Z3 BUY CONFIRMED\nmint={}\nbuy_sig={}\ntokens={}\ncost_sol={:.9}\nauto_sell={}\ndiagnostic={}",
+                target.mint,
+                sig,
+                plan.expected_tokens_out,
+                plan.spend_lamports as f64 / 1e9,
+                env_bool("LIVE_AUTO_SELL_ENABLED", false),
+                diagnostic
+            ))
+            .await;
+            if env_bool("LIVE_AUTO_SELL_ENABLED", false) {
+                let mut live_state = state;
+                run_z3_live_auto_sell_monitor(
+                    rpc,
+                    executor,
+                    ledger,
+                    target,
+                    &mut live_state,
+                    payer_ref,
+                )
+                .await?;
+            }
+        }
+        TxTerminalStatus::Failed(err) => {
+            let reason = if diagnostic {
+                format!("pool_level_rejected:{err}")
+            } else {
+                format!("transaction_failed:{err}")
+            };
+            save_live_failed(
+                ledger,
+                live_variant,
+                target,
+                plan,
+                gate,
+                stability,
+                sig.to_string(),
+                &reason,
+                if diagnostic {
+                    "POOL_LEVEL_REJECTED"
+                } else {
+                    ""
+                },
+            );
+        }
+        TxTerminalStatus::TimeoutUnknown => {
+            save_live_failed(
+                ledger,
+                live_variant,
+                target,
+                plan,
+                gate,
+                stability,
+                sig.to_string(),
+                &format!("confirmation_timeout_unknown:{sig}"),
+                if diagnostic {
+                    "ONCHAIN_DIAGNOSTIC_TEST"
+                } else {
+                    ""
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn save_live_failed(
+    ledger: &LedgerManager,
+    live_variant: &str,
+    target: &MigrationTarget,
+    plan: &engine::BuiltBuyPlan,
+    gate: &engine::AdvancedGateDecision,
+    stability: &engine::LiveEntryStabilityDecision,
+    tx_signature: String,
+    reason: &str,
+    diagnostic_label: &str,
+) {
+    let reason = sanitize_live_error(reason);
+    let mut state = live_position_state(
+        live_variant,
+        target,
+        plan,
+        gate,
+        "live_failed",
+        tx_signature.clone(),
+        &reason,
+    );
+    apply_live_entry_stability_state(&mut state, stability);
+    if !diagnostic_label.is_empty() {
+        mark_diagnostic(&mut state, diagnostic_label);
+    }
+    if let Err(save_err) = ledger.save_new_position(&state) {
+        eprintln!(
+            "⚠️ LIVE FAILED STATE SAVE FAILED for {} sig={}: {save_err}",
+            target.mint, tx_signature
+        );
+    }
+    println!(
+        "❌ LIVE FAILED: {} | sig={} reason={} diagnostic_label={}",
+        target.mint,
+        if tx_signature.is_empty() {
+            "<none>"
+        } else {
+            &tx_signature
+        },
+        reason,
+        diagnostic_label
+    );
+}
+
+fn mark_diagnostic(state: &mut PositionState, label: &str) {
+    state.diagnostic_label = label.to_string();
+    state.diagnostic_day = diagnostic_day_utc();
+}
+
+fn diagnostic_day_utc() -> String {
+    Utc::now().format("%Y-%m-%d").to_string()
+}
+
+fn live_onchain_diagnostic_max_per_day() -> usize {
+    env_u64("LIVE_ONCHAIN_DIAGNOSTIC_MAX_PER_DAY", 2).clamp(0, 10) as usize
+}
+
+fn validate_onchain_diagnostic_allowed(
+    ledger: &LedgerManager,
+    target: &MigrationTarget,
+) -> Result<(), String> {
+    if !env_bool("LIVE_ONCHAIN_DIAGNOSTIC_ENABLED", false) {
+        return Err("diagnostic_disabled".into());
+    }
+    if env_bool("PAPER_MODE", true) || !env_bool("LIVE_ARMED", false) {
+        return Err("diagnostic_requires_live_armed".into());
+    }
+    if !env_bool("AMM_LIVE_CANARY", false) {
+        return Err("diagnostic_requires_canary".into());
+    }
+    if env_f64("BUY_AMOUNT_SOL", 0.003) > 0.003 {
+        return Err("diagnostic_buy_amount_too_large".into());
+    }
+    if env_u64("MAX_TRADES_PER_RUN", 1) != 1 {
+        return Err("diagnostic_requires_single_trade".into());
+    }
+    if !env_bool("LIVE_AUTO_SELL_ENABLED", false) || !env_bool("LIVE_SELL_SEND_ENABLED", false) {
+        return Err("diagnostic_requires_auto_sell".into());
+    }
+
+    let rows = ledger
+        .read_all()
+        .map_err(|e| format!("diagnostic_ledger_read_failed:{e}"))?;
+    if diagnostic_already_used_for_pool(&rows, target) {
+        return Err("diagnostic_pool_already_tested".into());
+    }
+    let today = diagnostic_day_utc();
+    let count = diagnostic_count_for_day(&rows, &today);
+    let max = live_onchain_diagnostic_max_per_day();
+    if count >= max {
+        return Err("diagnostic_daily_limit_reached".into());
+    }
+    Ok(())
+}
+
+fn diagnostic_count_for_day(rows: &[PositionState], day: &str) -> usize {
+    rows.iter()
+        .filter(|r| r.diagnostic_day == day && is_diagnostic_label(&r.diagnostic_label))
+        .count()
+}
+
+fn diagnostic_already_used_for_pool(rows: &[PositionState], target: &MigrationTarget) -> bool {
+    rows.iter().any(|r| {
+        is_diagnostic_label(&r.diagnostic_label)
+            && (r.mint == target.mint
+                || (!target.pool_state.is_empty() && r.pool_state == target.pool_state))
+    })
+}
+
+fn is_diagnostic_label(label: &str) -> bool {
+    matches!(
+        label,
+        "ONCHAIN_DIAGNOSTIC_TEST" | "RPC_PREFLIGHT_FALSE_REJECTION" | "POOL_LEVEL_REJECTED"
+    )
 }
 
 fn validate_live_start(paper_mode: bool, live_armed: bool) -> anyhow::Result<()> {
@@ -797,116 +991,6 @@ fn apply_live_entry_stability_state(
         .map(|s| s.quote_reserve_raw)
         .unwrap_or(state.quote_reserve_raw);
     state.quote_reserve_ui = state.quote_reserve_raw as f64 / 1e9;
-}
-
-fn is_live_buy_exceeded_slippage_error(error: &str) -> bool {
-    let normalized = error.to_ascii_lowercase().replace(' ', "");
-    normalized.contains("exceededslippage")
-        || normalized.contains("custom\":6004")
-        || normalized.contains("custom:6004")
-        || normalized.contains("custom(6004)")
-        || normalized.contains("custom\\\":6004")
-}
-
-struct DiagnosticGuard {
-    allowed: bool,
-    reason: String,
-}
-
-fn check_diagnostic_guard(_ledger: &LedgerManager, mint: &str) -> DiagnosticGuard {
-    if !env_bool("LIVE_ONCHAIN_DIAGNOSTIC_ENABLED", false) {
-        return DiagnosticGuard {
-            allowed: false,
-            reason: "diagnostic_disabled".into(),
-        };
-    }
-    let max_per_day = env_u64("LIVE_ONCHAIN_DIAGNOSTIC_MAX_PER_DAY", 2);
-    let today = chrono::Utc::now().format("%Y%m%d").to_string();
-    let key = format!("DIAGNOSTIC_COUNT_{today}");
-    // Atomic diagnostic counter via state.jsonl helper entries
-    let count = count_diagnostic_attempts_today(_ledger, &today);
-    if count >= max_per_day {
-        return DiagnosticGuard {
-            allowed: false,
-            reason: format!("diagnostic_daily_limit_reached:count={count} max={max_per_day}"),
-        };
-    }
-    // Per-pool check: already tested this mint in diagnostic mode today
-    if mint_already_tested(_ledger, mint, &today) {
-        return DiagnosticGuard {
-            allowed: false,
-            reason: format!("diagnostic_pool_already_tested:mint={mint}"),
-        };
-    }
-    DiagnosticGuard {
-        allowed: true,
-        reason: "diagnostic_allowed".into(),
-    }
-}
-
-fn count_diagnostic_attempts_today(_ledger: &LedgerManager, today: &str) -> u64 {
-    // Count diagnostic-labeled rows in state.jsonl for today via timestamp in tx
-    // For simplicity: count live_failed with exit_reason containing "onchain_diag" 
-    // or "POOL_LEVEL_REJECTED" or "RPC_PREFLIGHT_FALSE_REJECTION"
-    // This is a lightweight approach — no new file.
-    let path = std::path::Path::new("state.jsonl");
-    let today_prefix = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let mut count = 0u64;
-    if let Ok(content) = std::fs::read_to_string(path) {
-        for line in content.lines().rev().take(2000) {
-            if !line.contains(&today_prefix) {
-                continue;
-            }
-            let lower = line.to_lowercase();
-            if lower.contains("onchain_diagnostic")
-                || lower.contains("pool_level_rejected")
-                || lower.contains("rpc_preflight_false_rejection")
-            {
-                count += 1;
-            }
-        }
-    }
-    count
-}
-
-fn mint_already_tested(_ledger: &LedgerManager, mint: &str, today: &str) -> bool {
-    let path = std::path::Path::new("state.jsonl");
-    let today_prefix = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    if let Ok(content) = std::fs::read_to_string(path) {
-        for line in content.lines().rev().take(2000) {
-            if !line.contains(&today_prefix) {
-                continue;
-            }
-            if line.contains(mint)
-                && (line.contains("ONCHAIN_DIAGNOSTIC")
-                    || line.contains("onchain_diagnostic")
-                    || line.contains("POOL_LEVEL_REJECTED")
-                    || line.contains("RPC_PREFLIGHT_FALSE_REJECTION"))
-            {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn record_diagnostic_attempt(ledger: &LedgerManager, mint: &str, passed: bool) {
-    let diagnostic_label = if passed {
-        "RPC_PREFLIGHT_FALSE_REJECTION"
-    } else {
-        "POOL_LEVEL_REJECTED"
-    };
-    let state = PositionState {
-        variant_id: "Z3".into(),
-        mint: mint.into(),
-        status: if passed { "holding" } else { "live_failed" }.into(),
-        exit_reason: format!("onchain_diagnostic_test:diagnostic_label={}", diagnostic_label),
-        excluded_from_stats: !passed,
-        ..Default::default()
-    };
-    if let Err(e) = ledger.save_new_position(&state) {
-        eprintln!("⚠️ DIAGNOSTIC RECORD SAVE FAILED for {mint}: {e}");
-    }
 }
 
 fn sanitize_live_error(error: &str) -> String {
@@ -1547,8 +1631,10 @@ fn env_f64(key: &str, default: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
+        diagnostic_already_used_for_pool, diagnostic_count_for_day, is_diagnostic_label,
         latest_open_live_holding, rescue_sell_bps_list_from_env_value, sanitize_live_error,
-        target_from_live_state, validate_live_start, z3_live_exit_reason,
+        target_from_live_state, validate_live_start, validate_onchain_diagnostic_allowed,
+        z3_live_exit_reason,
     };
     use crate::state::{LedgerManager, PositionState};
     use std::sync::Mutex;
@@ -1631,9 +1717,9 @@ mod tests {
     #[test]
     fn live_send_error_classifier_detects_pump_amm_exceeded_slippage() {
         let err = "RPC response error -32002: Transaction simulation failed: {\"InstructionError\":[3,{\"Custom\":6004}]}";
-        assert!(crate::is_live_buy_exceeded_slippage_error(err));
-        assert!(crate::is_live_buy_exceeded_slippage_error("ExceededSlippage"));
-        assert!(!crate::is_live_buy_exceeded_slippage_error("Custom\\\":6005"));
+        assert!(crate::executor::is_preflight_6004_error(err));
+        assert!(crate::executor::is_preflight_6004_error("ExceededSlippage"));
+        assert!(!crate::executor::is_preflight_6004_error("Custom\\\":6005"));
     }
 
     #[test]
@@ -1710,6 +1796,105 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    fn diagnostic_target() -> crate::engine::MigrationTarget {
+        crate::engine::MigrationTarget {
+            mint: "DiagMint".into(),
+            source: "helius_migration".into(),
+            pool_state: "DiagPool".into(),
+            base_mint: "So11111111111111111111111111111111111111112".into(),
+            quote_mint: "DiagMint".into(),
+            quote_asset_mint: "So11111111111111111111111111111111111111112".into(),
+            pool_base_token_account: "BaseVault".into(),
+            pool_quote_token_account: "TokenVault".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn diagnostic_label_helpers_count_daily_and_pool_usage() {
+        let rows = vec![
+            PositionState {
+                mint: "DiagMint".into(),
+                pool_state: "DiagPool".into(),
+                diagnostic_label: "RPC_PREFLIGHT_FALSE_REJECTION".into(),
+                diagnostic_day: "2026-06-08".into(),
+                ..Default::default()
+            },
+            PositionState {
+                mint: "OtherMint".into(),
+                pool_state: "OtherPool".into(),
+                diagnostic_label: "POOL_LEVEL_REJECTED".into(),
+                diagnostic_day: "2026-06-08".into(),
+                ..Default::default()
+            },
+            PositionState {
+                mint: "Ignored".into(),
+                diagnostic_label: "".into(),
+                diagnostic_day: "2026-06-08".into(),
+                ..Default::default()
+            },
+        ];
+        assert!(is_diagnostic_label("ONCHAIN_DIAGNOSTIC_TEST"));
+        assert_eq!(diagnostic_count_for_day(&rows, "2026-06-08"), 2);
+        assert!(diagnostic_already_used_for_pool(
+            &rows,
+            &diagnostic_target()
+        ));
+    }
+
+    #[test]
+    fn diagnostic_guard_requires_flag_and_daily_limit() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_live_env();
+        set_required_canary_env();
+        std::env::set_var("PAPER_MODE", "false");
+        std::env::set_var("LIVE_ARMED", "true");
+        std::env::set_var("LIVE_SEND_ENABLED", "true");
+        std::env::set_var("LIVE_AUTO_SELL_ENABLED", "true");
+        std::env::set_var("LIVE_SELL_SEND_ENABLED", "true");
+        std::env::set_var("LIVE_ONCHAIN_DIAGNOSTIC_MAX_PER_DAY", "2");
+
+        let path = std::env::temp_dir().join(format!(
+            "huragan_diag_guard_test_{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let ledger = LedgerManager::new(&path);
+        let target = diagnostic_target();
+        assert_eq!(
+            validate_onchain_diagnostic_allowed(&ledger, &target).unwrap_err(),
+            "diagnostic_disabled"
+        );
+
+        std::env::set_var("LIVE_ONCHAIN_DIAGNOSTIC_ENABLED", "true");
+        validate_onchain_diagnostic_allowed(&ledger, &target).unwrap();
+        ledger
+            .save_new_position(&PositionState {
+                mint: "A".into(),
+                pool_state: "A".into(),
+                diagnostic_label: "POOL_LEVEL_REJECTED".into(),
+                diagnostic_day: super::diagnostic_day_utc(),
+                ..Default::default()
+            })
+            .unwrap();
+        ledger
+            .save_new_position(&PositionState {
+                mint: "B".into(),
+                pool_state: "B".into(),
+                diagnostic_label: "RPC_PREFLIGHT_FALSE_REJECTION".into(),
+                diagnostic_day: super::diagnostic_day_utc(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            validate_onchain_diagnostic_allowed(&ledger, &target).unwrap_err(),
+            "diagnostic_daily_limit_reached"
+        );
+        let _ = std::fs::remove_file(path);
+        clear_live_env();
+        std::env::remove_var("PAPER_MODE");
+        std::env::remove_var("LIVE_ARMED");
+    }
+
     fn set_required_canary_env() {
         std::env::set_var("AMM_LIVE_CANARY", "true");
         std::env::set_var("HELIUS_MIGRATION_ENABLED", "true");
@@ -1737,6 +1922,8 @@ mod tests {
             "LIVE_AUTO_SELL_ENABLED",
             "LIVE_SELL_SEND_ENABLED",
             "LIVE_SEND_BACKEND",
+            "LIVE_ONCHAIN_DIAGNOSTIC_ENABLED",
+            "LIVE_ONCHAIN_DIAGNOSTIC_MAX_PER_DAY",
         ] {
             std::env::remove_var(key);
         }

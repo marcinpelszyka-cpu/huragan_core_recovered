@@ -26,6 +26,8 @@ struct PositionLike {
     #[serde(default)]
     excluded_from_stats: bool,
     #[serde(default)]
+    diagnostic_label: String,
+    #[serde(default)]
     advanced_gate_passed: bool,
 }
 
@@ -60,6 +62,10 @@ struct Metrics {
     live_completed_profit: usize,
     live_completed_loss: usize,
     live_failed_entry_gate: usize,
+    live_diagnostic_onchain_test: usize,
+    live_rpc_preflight_false_rejection: usize,
+    live_pool_level_rejected: usize,
+    live_diagnostic_daily_limit_reached: usize,
     live_unrecoverable_dust_or_rug: usize,
 }
 
@@ -218,6 +224,22 @@ fn main() -> anyhow::Result<()> {
         .iter()
         .filter(|r| r.status == "live_failed" && r.exit_reason.starts_with("live_entry_"))
         .count();
+    let live_diagnostic_onchain_test = live_latest_rows
+        .iter()
+        .filter(|r| r.diagnostic_label == "ONCHAIN_DIAGNOSTIC_TEST")
+        .count();
+    let live_rpc_preflight_false_rejection = live_latest_rows
+        .iter()
+        .filter(|r| r.diagnostic_label == "RPC_PREFLIGHT_FALSE_REJECTION")
+        .count();
+    let live_pool_level_rejected = live_latest_rows
+        .iter()
+        .filter(|r| r.diagnostic_label == "POOL_LEVEL_REJECTED")
+        .count();
+    let live_diagnostic_daily_limit_reached = live_latest_rows
+        .iter()
+        .filter(|r| r.exit_reason.starts_with("diagnostic_daily_limit_reached"))
+        .count();
     let live_unrecoverable_dust_or_rug = live_latest_rows
         .iter()
         .filter(|r| r.status == "unrecoverable_dust_or_rug")
@@ -319,6 +341,10 @@ fn main() -> anyhow::Result<()> {
             live_completed_profit,
             live_completed_loss,
             live_failed_entry_gate,
+            live_diagnostic_onchain_test,
+            live_rpc_preflight_false_rejection,
+            live_pool_level_rejected,
+            live_diagnostic_daily_limit_reached,
             live_unrecoverable_dust_or_rug,
         },
         variant_metrics,

@@ -2,12 +2,24 @@
 set -euo pipefail
 cd /opt/huragan_core
 BPS=${1:-8500}
+DIAGNOSTIC=${2:-${LIVE_ONCHAIN_DIAGNOSTIC_ENABLED:-false}}
+DIAGNOSTIC_MAX=${LIVE_ONCHAIN_DIAGNOSTIC_MAX_PER_DAY:-2}
 WALLET_FILE=${HURAGAN_CANARY_WALLET_FILE:-/root/.huragan_wallets/huragan_new_wallet_20260604_003229.env}
 case "$BPS" in
   ''|*[!0-9]*) echo "invalid bps: $BPS" >&2; exit 2;;
 esac
 if [ "$BPS" -lt 1000 ] || [ "$BPS" -gt 10000 ]; then
   echo "invalid bps range: $BPS" >&2; exit 2
+fi
+case "$DIAGNOSTIC" in
+  true|false) ;;
+  *) echo "invalid diagnostic flag: $DIAGNOSTIC (use true/false)" >&2; exit 2;;
+esac
+case "$DIAGNOSTIC_MAX" in
+  ''|*[!0-9]*) echo "invalid diagnostic max: $DIAGNOSTIC_MAX" >&2; exit 2;;
+esac
+if [ "$DIAGNOSTIC_MAX" -gt 10 ]; then
+  echo "diagnostic max too high: $DIAGNOSTIC_MAX" >&2; exit 2
 fi
 if [ ! -r "$WALLET_FILE" ]; then
   echo "wallet file not readable: $WALLET_FILE" >&2; exit 3
@@ -75,8 +87,8 @@ Environment=EMERGENCY_JITO_TIP_LAMPORTS=0
 Environment=AMM_MIN_POOL_SOL_FOR_ENTRY_LAMPORTS=2000000000
 Environment=LIVE_SEND_BACKEND=rpc
 Environment=LIVE_SEND_PREFLIGHT_COMMITMENT=processed
-Environment=LIVE_ONCHAIN_DIAGNOSTIC_ENABLED=true
-Environment=LIVE_ONCHAIN_DIAGNOSTIC_MAX_PER_DAY=2
+Environment=LIVE_ONCHAIN_DIAGNOSTIC_ENABLED=$DIAGNOSTIC
+Environment=LIVE_ONCHAIN_DIAGNOSTIC_MAX_PER_DAY=$DIAGNOSTIC_MAX
 EOF
 systemctl daemon-reload
 systemctl reset-failed migration-sniper.service || true
