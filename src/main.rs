@@ -415,21 +415,70 @@ async fn main() -> anyhow::Result<()> {
                 );
 
                 let executor = executor::Executor::new(rpc_url.clone());
-                match executor
-                    .send_with_preflight(payer_ref, &fresh_plan.instructions)
-                    .await
-                {
+                let mut submitted_plan = fresh_plan.clone();
+                let mut slippage_rebuilds = 0u64;
+                let send_result = loop {
+                    match executor
+                        .send_with_preflight(payer_ref, &submitted_plan.instructions)
+                        .await
+                    {
+                        Ok(sig) => break Ok(sig),
+                        Err(e) => {
+                            let raw_error = e.to_string();
+                            if !is_live_buy_exceeded_slippage_error(&raw_error) || slippage_rebuilds >= 2 {
+                                break Err(anyhow::anyhow!(raw_error));
+                            }
+                            slippage_rebuilds += 1;
+                            println!(
+                                "🔁 LIVE SEND SLIPPAGE REBUILD: {} | attempt={} reason=ExceededSlippage",
+                                target.mint, slippage_rebuilds
+                            );
+                            let retry_plan = match engine::process_migration_and_build_amm_ixs(
+                                &rpc,
+                                &target,
+                                buy_lamports,
+                                payer.as_ref(),
+                                true,
+                            )
+                            .await
+                            {
+                                Ok(p) if p.simulation_ok => p,
+                                Ok(p) => {
+                                    break Err(anyhow::anyhow!(
+                                        "live_send_slippage_rebuild_preflight_failed:expected={} min={}",
+                                        p.expected_tokens_out,
+                                        p.min_tokens_out
+                                    ));
+                                }
+                                Err(rebuild_err) => {
+                                    break Err(anyhow::anyhow!(
+                                        "live_send_slippage_rebuild_failed:{rebuild_err}"
+                                    ));
+                                }
+                            };
+                            println!(
+                                "🔁 LIVE SEND REBUILT: {} | prev_expected={} fresh_expected={} fresh_min={}",
+                                target.mint,
+                                submitted_plan.expected_tokens_out,
+                                retry_plan.expected_tokens_out,
+                                retry_plan.min_tokens_out
+                            );
+                            submitted_plan = retry_plan;
+                        }
+                    }
+                };
+                match send_result {
                     Ok(sig) => {
                         println!(
                             "🚀 LIVE SUBMITTED: {} | sig={} tokens={}",
-                            target.mint, sig, fresh_plan.expected_tokens_out
+                            target.mint, sig, submitted_plan.expected_tokens_out
                         );
                         match executor.wait_terminal_status(&sig, 10).await? {
                             TxTerminalStatus::Confirmed => {
                                 let mut state = live_position_state(
                                     &live_variant,
                                     &target,
-                                    &fresh_plan,
+                                    &submitted_plan,
                                     &gate,
                                     "holding",
                                     sig.to_string(),
@@ -444,7 +493,7 @@ async fn main() -> anyhow::Result<()> {
                                 }
                                 println!(
                                     "✅ LIVE CONFIRMED: {} | sig={} tokens={}",
-                                    target.mint, sig, fresh_plan.expected_tokens_out
+                                    target.mint, sig, submitted_plan.expected_tokens_out
                                 );
                                 println!("📝 LIVE POSITION SAVED: {} holding", target.mint);
                                 notifier::send_telegram_alert(format!(
@@ -456,8 +505,8 @@ cost_sol={:.9}
 auto_sell={}",
                                     target.mint,
                                     sig,
-                                    fresh_plan.expected_tokens_out,
-                                    fresh_plan.spend_lamports as f64 / 1e9,
+                                    submitted_plan.expected_tokens_out,
+                                    submitted_plan.spend_lamports as f64 / 1e9,
                                     env_bool("LIVE_AUTO_SELL_ENABLED", false)
                                 ))
                                 .await;
@@ -480,7 +529,7 @@ auto_sell={}",
                                 let state = live_position_state(
                                     &live_variant,
                                     &target,
-                                    &fresh_plan,
+                                    &submitted_plan,
                                     &gate,
                                     "live_failed",
                                     sig.to_string(),
@@ -512,7 +561,7 @@ reason={}",
                                 let state = live_position_state(
                                     &live_variant,
                                     &target,
-                                    &fresh_plan,
+                                    &submitted_plan,
                                     &gate,
                                     "live_failed",
                                     sig.to_string(),
@@ -544,7 +593,7 @@ reason={}",
                         let state = live_position_state(
                             &live_variant,
                             &target,
-                            &fresh_plan,
+                            &submitted_plan,
                             &gate,
                             "live_failed",
                             String::new(),
@@ -705,6 +754,15 @@ fn apply_live_entry_stability_state(
         .map(|s| s.quote_reserve_raw)
         .unwrap_or(state.quote_reserve_raw);
     state.quote_reserve_ui = state.quote_reserve_raw as f64 / 1e9;
+}
+
+fn is_live_buy_exceeded_slippage_error(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase().replace(' ', "");
+    normalized.contains("exceededslippage")
+        || normalized.contains("custom\":6004")
+        || normalized.contains("custom:6004")
+        || normalized.contains("custom(6004)")
+        || normalized.contains("custom\\\":6004")
 }
 
 fn sanitize_live_error(error: &str) -> String {
@@ -1424,6 +1482,14 @@ mod tests {
         let err = validate_live_start(false, true).unwrap_err().to_string();
         assert!(err.contains("LIVE_SEND_BACKEND"));
         clear_live_env();
+    }
+
+    #[test]
+    fn live_send_error_classifier_detects_pump_amm_exceeded_slippage() {
+        let err = "RPC response error -32002: Transaction simulation failed: {\"InstructionError\":[3,{\"Custom\":6004}]}";
+        assert!(crate::is_live_buy_exceeded_slippage_error(err));
+        assert!(crate::is_live_buy_exceeded_slippage_error("ExceededSlippage"));
+        assert!(!crate::is_live_buy_exceeded_slippage_error("Custom\\\":6005"));
     }
 
     #[test]
