@@ -113,6 +113,7 @@ class Rpc:
         self.backoff_s = max(0.0, float(backoff_s))
         self.calls = 0
         self.errors = Counter()
+        self.retry_errors = Counter()
         self.retry_events = 0
 
     def call(self, method, params):
@@ -124,12 +125,20 @@ class Rpc:
                 last = e
                 retryable = "429" in str(e) or "transport_error" in str(e)
                 if not retryable or attempt >= self.retries:
+                    self._record_terminal_error(e)
                     raise
+                self._record_retry_error(e)
                 self.retry_events += 1
                 delay = self.backoff_s * (attempt + 1)
                 if delay:
                     time.sleep(delay)
         raise last or RuntimeError("rpc_unknown_error")
+
+    def _record_retry_error(self, err):
+        self.retry_errors[error_bucket(str(err))] += 1
+
+    def _record_terminal_error(self, err):
+        self.errors[error_bucket(str(err))] += 1
 
     def _call_once(self, method, params):
         self.calls += 1
@@ -141,22 +150,26 @@ class Rpc:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 out = json.load(resp)
         except urllib.error.HTTPError as e:
-            self.errors[str(e.code)] += 1
             raise RuntimeError(f"http_error:{e.code}")
         except Exception as e:
-            self.errors["transport"] += 1
             raise RuntimeError(f"transport_error:{e}")
         if out.get("error"):
             err = out["error"]
             msg = str(err)
-            if "429" in msg or "Too Many" in msg:
-                self.errors["429"] += 1
-            elif "401" in msg or "Unauthorized" in msg:
-                self.errors["401"] += 1
-            else:
-                self.errors["rpc"] += 1
             raise RuntimeError(f"rpc_error:{err}")
         return out.get("result")
+
+
+def error_bucket(text):
+    if "429" in text or "Too Many" in text:
+        return "429"
+    if "401" in text or "Unauthorized" in text:
+        return "401"
+    if "transport_error" in text:
+        return "transport"
+    if "http_error:" in text:
+        return text.split("http_error:", 1)[1].split()[0]
+    return "rpc"
 
 
 def gtfa_fetch(rpc, address, *, start_time=None, end_time=None, limit=1000, max_pages=1):
@@ -583,6 +596,7 @@ def run(args):
         write_clusters_csv(args.out_clusters, clusters)
         write_jsonl(args.out_signals, signals)
     err_total = sum(rpc.errors.values())
+    retry_err_total = sum(rpc.retry_errors.values())
     return {
         "processed_mints": processed,
         "early_buyer_clusters": early_clusters,
@@ -590,10 +604,12 @@ def run(args):
         "signals": len(signals),
         "shared_mother_clusters": sum(1 for s in signals if s.get("shared_mother_count", 0) >= 2),
         "rpc_calls": rpc.calls,
-        "errors_total": err_total,
-        "errors": dict(rpc.errors),
+        "terminal_errors_total": err_total,
+        "terminal_errors": dict(rpc.errors),
+        "retry_errors_total": retry_err_total,
+        "retry_errors": dict(rpc.retry_errors),
         "retry_events": rpc.retry_events,
-        "error_pct": round(err_total / max(1, rpc.calls) * 100, 4),
+        "terminal_error_pct": round(err_total / max(1, rpc.calls) * 100, 4),
         "dry_run": args.dry_run,
         "live_allowed": False,
         "out_edges": args.out_edges,

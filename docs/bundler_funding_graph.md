@@ -95,7 +95,7 @@ DEV_SNIPER_SUSPECT / shared mother cluster to avoid
 ```text
 processed_mints >= 500
 early_buyer_clusters >= 100
-429 error pct < 5% after retry/backoff
+terminal 429/error pct < 5% after retry/backoff; retry_errors reported separately
 top mother wallets repeat across multiple mints
 risk_score correlates with hard_stop/rug/dust outcomes
 follow_score correlates with positive 30s/60s forward outcome
