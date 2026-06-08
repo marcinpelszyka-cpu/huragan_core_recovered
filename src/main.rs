@@ -425,8 +425,28 @@ async fn main() -> anyhow::Result<()> {
                         Ok(sig) => break Ok(sig),
                         Err(e) => {
                             let raw_error = e.to_string();
-                            if !is_live_buy_exceeded_slippage_error(&raw_error) || slippage_rebuilds >= 2 {
+                            if !is_live_buy_exceeded_slippage_error(&raw_error) {
                                 break Err(anyhow::anyhow!(raw_error));
+                            }
+                            if slippage_rebuilds >= 2 {
+                                // Diagnostic: 3rd attempt with skip_preflight to test if RPC sim
+                                // is false-rejecting or pool genuinely blocks the tx.
+                                let skip = executor.send_skip_preflight(payer_ref, &submitted_plan.instructions).await;
+                                match skip {
+                                    Ok(sig) => {
+                                        println!(
+                                            "🧪 ONCHAIN_DIAGNOSTIC_TEST PASSED: {} | sig={} → RPC_PREFLIGHT_FALSE_REJECTION",
+                                            target.mint, sig
+                                        );
+                                        break Ok(sig);
+                                    }
+                                    Err(skip_err) => {
+                                        break Err(anyhow::anyhow!(
+                                            "POOL_LEVEL_REJECTED:{} mint={} onchain_skip_preflight_error={}",
+                                            raw_error, target.mint, skip_err
+                                        ));
+                                    }
+                                }
                             }
                             slippage_rebuilds += 1;
                             println!(
