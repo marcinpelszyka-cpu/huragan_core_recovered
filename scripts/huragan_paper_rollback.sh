@@ -17,6 +17,7 @@ setvals={
  'ALLOW_PLAINTEXT_PRIVATE_KEY':'false',
  'AMM_LIVE_CANARY':'false',
  'AMM_LIVE_BUY_MIN_OUT_BPS':'9000',
+ 'LIVE_SEND_BACKEND':'rpc',
 }
 remove={'SOLANA_PRIVATE_KEY_BASE58'}
 out=[]; seen=set()
@@ -46,6 +47,7 @@ Environment=LIVE_AUTO_SELL_ENABLED=false
 Environment=LIVE_SELL_SEND_ENABLED=false
 Environment=ALLOW_PLAINTEXT_PRIVATE_KEY=false
 Environment=AMM_LIVE_CANARY=false
+Environment=LIVE_SEND_BACKEND=rpc
 EOF
 systemctl daemon-reload
 systemctl reset-failed migration-sniper.service || true

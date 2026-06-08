@@ -138,6 +138,18 @@ pub struct PositionState {
     #[serde(default)]
     pub live_sell_family: String,
     #[serde(default)]
+    pub live_send_backend: String,
+    #[serde(default)]
+    pub live_send_day: String,
+    #[serde(default)]
+    pub sender_endpoint_mode: String,
+    #[serde(default)]
+    pub sender_tip_lamports: u64,
+    #[serde(default)]
+    pub sender_cu_limit: u32,
+    #[serde(default)]
+    pub sender_cu_price_micro_lamports: u64,
+    #[serde(default)]
     pub diagnostic_label: String,
     #[serde(default)]
     pub diagnostic_day: String,

@@ -883,6 +883,34 @@ fn is_diagnostic_label(label: &str) -> bool {
     )
 }
 
+fn helius_sender_submit_count_for_day(rows: &[PositionState], day: &str) -> usize {
+    rows.iter()
+        .filter(|r| r.live_send_backend == "helius_sender" && r.live_send_day == day)
+        .map(|r| {
+            usize::from(!r.tx_signature.is_empty()) + usize::from(!r.sell_signature.is_empty())
+        })
+        .sum()
+}
+
+fn validate_helius_sender_daily_limit(ledger: &LedgerManager) -> anyhow::Result<()> {
+    let max = executor::helius_sender_max_per_day();
+    if max == 0 {
+        anyhow::bail!("HELIUS_SENDER_MAX_PER_DAY must be > 0");
+    }
+    let rows = ledger.read_all()?;
+    let today = diagnostic_day_utc();
+    let count = helius_sender_submit_count_for_day(&rows, &today);
+    if count >= max {
+        anyhow::bail!(
+            "HELIUS_SENDER_MAX_PER_DAY exceeded: {} >= {} for {}",
+            count,
+            max,
+            today
+        );
+    }
+    Ok(())
+}
+
 fn validate_live_start(paper_mode: bool, live_armed: bool) -> anyhow::Result<()> {
     if paper_mode || !live_armed {
         return Ok(());
@@ -908,8 +936,21 @@ fn validate_live_start(paper_mode: bool, live_armed: bool) -> anyhow::Result<()>
         anyhow::bail!("AMM CANARY BLOCKED: LIVE_VARIANT must be Z3");
     }
     if env_bool("LIVE_SEND_ENABLED", false) {
-        if env::var("LIVE_SEND_BACKEND").unwrap_or_else(|_| "rpc".into()) != "rpc" {
-            anyhow::bail!("AMM CANARY BLOCKED: LIVE_SEND_BACKEND must be rpc in this build");
+        let backend = env::var("LIVE_SEND_BACKEND").unwrap_or_else(|_| "rpc".into());
+        if backend != "rpc" && backend != "helius_sender" {
+            anyhow::bail!(
+                "AMM CANARY BLOCKED: LIVE_SEND_BACKEND must be rpc or helius_sender in this build"
+            );
+        }
+        if backend == "helius_sender" {
+            let endpoint = env::var("HELIUS_SENDER_ENDPOINT")
+                .unwrap_or_else(|_| "https://sender.helius-rpc.com/fast?swqos_only=true".into());
+            let mode = executor::helius_sender_endpoint_mode(&endpoint);
+            let tip = env_u64("HELIUS_SENDER_TIP_LAMPORTS", 5_000);
+            executor::validate_sender_tip(mode, tip)
+                .map_err(|e| anyhow::anyhow!("AMM CANARY BLOCKED: {e}"))?;
+            validate_helius_sender_daily_limit(&LedgerManager::default())
+                .map_err(|e| anyhow::anyhow!("AMM CANARY BLOCKED: {e}"))?;
         }
         if !env_bool("LIVE_AUTO_SELL_ENABLED", false) {
             anyhow::bail!("AMM CANARY BLOCKED: LIVE_AUTO_SELL_ENABLED must be true for live send");
@@ -931,6 +972,11 @@ fn live_position_state(
     exit_reason: &str,
 ) -> PositionState {
     let failed = status == "live_failed";
+    let live_send_day = if should_count_live_sender_attempt(status, &tx_signature) {
+        diagnostic_day_utc()
+    } else {
+        String::new()
+    };
     PositionState {
         variant_id: variant_id.to_string(),
         mint: target.mint.clone(),
@@ -967,6 +1013,12 @@ fn live_position_state(
         entry_quote_reserve_raw: plan.entry_quote_reserve_raw,
         min_quote_reserve_raw: plan.entry_quote_reserve_raw,
         paper_buy_family: plan.instruction_family.clone(),
+        live_send_backend: live_send_backend_label(),
+        live_send_day,
+        sender_endpoint_mode: live_sender_endpoint_mode_label(),
+        sender_tip_lamports: env_u64("HELIUS_SENDER_TIP_LAMPORTS", 5_000),
+        sender_cu_limit: env_u64("HELIUS_SENDER_CU_LIMIT", 250_000).clamp(50_000, 1_400_000) as u32,
+        sender_cu_price_micro_lamports: env_u64("HELIUS_SENDER_CU_PRICE_MICRO_LAMPORTS", 200_000),
         advanced_gate_passed: gate.passed,
         advanced_gate_reason: gate.reason.clone(),
         advanced_gate_mode: gate.mode.clone(),
@@ -995,6 +1047,30 @@ fn apply_live_entry_stability_state(
         .map(|s| s.quote_reserve_raw)
         .unwrap_or(state.quote_reserve_raw);
     state.quote_reserve_ui = state.quote_reserve_raw as f64 / 1e9;
+}
+
+fn live_send_backend_label() -> String {
+    env::var("LIVE_SEND_BACKEND").unwrap_or_else(|_| "rpc".into())
+}
+
+fn should_count_live_sender_attempt(status: &str, tx_signature: &str) -> bool {
+    live_send_backend_label() == "helius_sender"
+        && !tx_signature.is_empty()
+        && matches!(
+            status,
+            "holding" | "live_failed" | "completed" | "live_sell_failed_retryable"
+        )
+}
+
+fn live_sender_endpoint_mode_label() -> String {
+    if live_send_backend_label() != "helius_sender" {
+        return String::new();
+    }
+    let endpoint = env::var("HELIUS_SENDER_ENDPOINT")
+        .unwrap_or_else(|_| "https://sender.helius-rpc.com/fast?swqos_only=true".into());
+    executor::helius_sender_endpoint_mode(&endpoint)
+        .as_str()
+        .into()
 }
 
 fn sanitize_live_error(error: &str) -> String {
@@ -1635,10 +1711,11 @@ fn env_f64(key: &str, default: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        diagnostic_already_used_for_pool, diagnostic_count_for_day, is_diagnostic_label,
-        latest_open_live_holding, rescue_sell_bps_list_from_env_value, sanitize_live_error,
-        target_from_live_state, validate_live_start, validate_onchain_diagnostic_allowed,
-        z3_live_exit_reason,
+        diagnostic_already_used_for_pool, diagnostic_count_for_day,
+        helius_sender_submit_count_for_day, is_diagnostic_label, latest_open_live_holding,
+        rescue_sell_bps_list_from_env_value, sanitize_live_error, target_from_live_state,
+        validate_helius_sender_daily_limit, validate_live_start,
+        validate_onchain_diagnostic_allowed, z3_live_exit_reason,
     };
     use crate::state::{LedgerManager, PositionState};
     use std::sync::Mutex;
@@ -1704,7 +1781,27 @@ mod tests {
     }
 
     #[test]
-    fn live_start_blocks_future_non_rpc_backend() {
+    fn live_start_allows_helius_sender_backend_with_valid_tip() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_live_env();
+        set_required_canary_env();
+        std::env::set_var("LIVE_SEND_ENABLED", "true");
+        std::env::set_var("LIVE_AUTO_SELL_ENABLED", "true");
+        std::env::set_var("LIVE_SELL_SEND_ENABLED", "true");
+        std::env::set_var("LIVE_SEND_BACKEND", "helius_sender");
+        std::env::set_var(
+            "HELIUS_SENDER_ENDPOINT",
+            "https://sender.helius-rpc.com/fast?swqos_only=true",
+        );
+        std::env::set_var("HELIUS_SENDER_TIP_LAMPORTS", "5000");
+        std::env::set_var("HELIUS_SENDER_MAX_PER_DAY", "2");
+
+        validate_live_start(false, true).unwrap();
+        clear_live_env();
+    }
+
+    #[test]
+    fn live_start_blocks_unknown_send_backend() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_live_env();
         set_required_canary_env();
@@ -1847,6 +1944,54 @@ mod tests {
     }
 
     #[test]
+    fn helius_sender_daily_limit_counts_buy_and_sell_submits() {
+        let today = super::diagnostic_day_utc();
+        let rows = vec![
+            PositionState {
+                live_send_backend: "helius_sender".into(),
+                live_send_day: today.clone(),
+                tx_signature: "buy_sig".into(),
+                sell_signature: "sell_sig".into(),
+                ..Default::default()
+            },
+            PositionState {
+                live_send_backend: "rpc".into(),
+                live_send_day: today.clone(),
+                tx_signature: "ignored".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(helius_sender_submit_count_for_day(&rows, &today), 2);
+    }
+
+    #[test]
+    fn helius_sender_daily_limit_blocks_at_configured_max() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_live_env();
+        std::env::set_var("HELIUS_SENDER_MAX_PER_DAY", "2");
+        let path = std::env::temp_dir().join(format!(
+            "huragan_sender_limit_test_{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let ledger = LedgerManager::new(&path);
+        ledger
+            .save_new_position(&PositionState {
+                live_send_backend: "helius_sender".into(),
+                live_send_day: super::diagnostic_day_utc(),
+                tx_signature: "buy_sig".into(),
+                sell_signature: "sell_sig".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let err = validate_helius_sender_daily_limit(&ledger)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("HELIUS_SENDER_MAX_PER_DAY exceeded"));
+        let _ = std::fs::remove_file(path);
+        clear_live_env();
+    }
+
+    #[test]
     fn diagnostic_guard_requires_flag_and_daily_limit() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_live_env();
@@ -1928,6 +2073,11 @@ mod tests {
             "LIVE_SEND_BACKEND",
             "LIVE_ONCHAIN_DIAGNOSTIC_ENABLED",
             "LIVE_ONCHAIN_DIAGNOSTIC_MAX_PER_DAY",
+            "HELIUS_SENDER_ENDPOINT",
+            "HELIUS_SENDER_TIP_LAMPORTS",
+            "HELIUS_SENDER_MAX_PER_DAY",
+            "HELIUS_SENDER_CU_LIMIT",
+            "HELIUS_SENDER_CU_PRICE_MICRO_LAMPORTS",
         ] {
             std::env::remove_var(key);
         }

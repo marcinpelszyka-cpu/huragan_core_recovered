@@ -16,6 +16,8 @@ name = "amm_sell_preflight"
 path = "src/bin/amm_sell_preflight.rs"
 
 [dependencies]
+bincode = "1"
+base64 = "0.22"
 anyhow = "1"
 bs58 = "0.5"
 chrono = { version = "0.4", features = ["serde"] }

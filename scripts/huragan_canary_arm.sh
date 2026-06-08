@@ -4,6 +4,7 @@ cd /opt/huragan_core
 BPS=${1:-8500}
 DIAGNOSTIC=${2:-${LIVE_ONCHAIN_DIAGNOSTIC_ENABLED:-false}}
 DIAGNOSTIC_MAX=${LIVE_ONCHAIN_DIAGNOSTIC_MAX_PER_DAY:-2}
+BACKEND=${3:-${LIVE_SEND_BACKEND:-rpc}}
 WALLET_FILE=${HURAGAN_CANARY_WALLET_FILE:-/root/.huragan_wallets/huragan_new_wallet_20260604_003229.env}
 case "$BPS" in
   ''|*[!0-9]*) echo "invalid bps: $BPS" >&2; exit 2;;
@@ -21,6 +22,10 @@ esac
 if [ "$DIAGNOSTIC_MAX" -gt 10 ]; then
   echo "diagnostic max too high: $DIAGNOSTIC_MAX" >&2; exit 2
 fi
+case "$BACKEND" in
+  rpc|helius_sender) ;;
+  *) echo "invalid live send backend: $BACKEND (use rpc/helius_sender)" >&2; exit 2;;
+esac
 if [ ! -r "$WALLET_FILE" ]; then
   echo "wallet file not readable: $WALLET_FILE" >&2; exit 3
 fi
@@ -85,10 +90,15 @@ Environment=MIGRATION_CAPTURE_MODE=false
 Environment=JITO_TIP_LAMPORTS=0
 Environment=EMERGENCY_JITO_TIP_LAMPORTS=0
 Environment=AMM_MIN_POOL_SOL_FOR_ENTRY_LAMPORTS=2000000000
-Environment=LIVE_SEND_BACKEND=rpc
+Environment=LIVE_SEND_BACKEND=$BACKEND
 Environment=LIVE_SEND_PREFLIGHT_COMMITMENT=processed
 Environment=LIVE_ONCHAIN_DIAGNOSTIC_ENABLED=$DIAGNOSTIC
 Environment=LIVE_ONCHAIN_DIAGNOSTIC_MAX_PER_DAY=$DIAGNOSTIC_MAX
+Environment=HELIUS_SENDER_ENDPOINT=${HELIUS_SENDER_ENDPOINT:-https://sender.helius-rpc.com/fast?swqos_only=true}
+Environment=HELIUS_SENDER_TIP_LAMPORTS=${HELIUS_SENDER_TIP_LAMPORTS:-5000}
+Environment=HELIUS_SENDER_CU_LIMIT=${HELIUS_SENDER_CU_LIMIT:-250000}
+Environment=HELIUS_SENDER_CU_PRICE_MICRO_LAMPORTS=${HELIUS_SENDER_CU_PRICE_MICRO_LAMPORTS:-200000}
+Environment=HELIUS_SENDER_MAX_PER_DAY=${HELIUS_SENDER_MAX_PER_DAY:-2}
 EOF
 systemctl daemon-reload
 systemctl reset-failed migration-sniper.service || true

@@ -1,10 +1,15 @@
+use base64::{engine::general_purpose, Engine as _};
+use serde_json::Value;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
+use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use solana_sdk::instruction::Instruction;
+use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature};
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
+use std::str::FromStr;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -13,6 +18,7 @@ pub struct Executor {
     backend: LiveSendBackend,
     preflight_commitment: CommitmentConfig,
     preflight_commitment_level: CommitmentLevel,
+    sender_client: reqwest::Client,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +38,7 @@ impl Executor {
             backend: live_send_backend(),
             preflight_commitment,
             preflight_commitment_level,
+            sender_client: reqwest::Client::new(),
         }
     }
 
@@ -55,6 +62,9 @@ impl Executor {
         payer: &Keypair,
         ixs: &[Instruction],
     ) -> anyhow::Result<Signature> {
+        if self.backend == LiveSendBackend::HeliusSender {
+            return self.send_with_sender(payer, ixs).await;
+        }
         if self.backend != LiveSendBackend::Rpc {
             anyhow::bail!(
                 "LIVE SEND BACKEND unsupported in this build: {}",
@@ -111,6 +121,55 @@ impl Executor {
         }
 
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("send_with_preflight_failed")))
+    }
+
+    async fn send_with_sender(
+        &self,
+        payer: &Keypair,
+        ixs: &[Instruction],
+    ) -> anyhow::Result<Signature> {
+        let cfg = HeliusSenderConfig::from_env()?;
+        let (bh, _last_valid_block_height) = self
+            .rpc
+            .get_latest_blockhash_with_commitment(self.preflight_commitment)
+            .await?;
+        let wrapped_ixs = wrap_sender_instructions(ixs, payer, &cfg)?;
+        let mut tx = Transaction::new_with_payer(&wrapped_ixs, Some(&payer.pubkey()));
+        tx.sign(&[payer], bh);
+        let raw = bincode::serialize(&tx)?;
+        let encoded = general_purpose::STANDARD.encode(raw);
+        println!(
+            "🛰️ LIVE SEND backend=helius_sender endpoint_mode={} skip_preflight=true tip_lamports={} cu_price_micro_lamports={} ixs={}",
+            cfg.endpoint_mode.as_str(),
+            cfg.tip_lamports,
+            cfg.cu_price_micro_lamports,
+            wrapped_ixs.len()
+        );
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": uuid::Uuid::new_v4().to_string(),
+            "method": "sendTransaction",
+            "params": [encoded, {"encoding": "base64", "skipPreflight": true, "maxRetries": 0}]
+        });
+        let resp: Value = self
+            .sender_client
+            .post(&cfg.endpoint)
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if let Some(err) = resp.get("error") {
+            anyhow::bail!(
+                "helius_sender_error:{}",
+                sanitize_sender_error(&err.to_string())
+            );
+        }
+        let sig = resp
+            .get("result")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("helius_sender_missing_signature"))?;
+        Ok(Signature::from_str(sig)?)
     }
 
     pub async fn send_onchain_diagnostic_skip_preflight(
@@ -191,6 +250,147 @@ impl Executor {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeliusSenderEndpointMode {
+    SwqosOnly,
+    Dual,
+}
+
+impl HeliusSenderEndpointMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SwqosOnly => "swqos_only",
+            Self::Dual => "dual",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HeliusSenderConfig {
+    pub endpoint: String,
+    pub endpoint_mode: HeliusSenderEndpointMode,
+    pub tip_lamports: u64,
+    pub cu_limit: u32,
+    pub cu_price_micro_lamports: u64,
+}
+
+impl HeliusSenderConfig {
+    pub fn from_env() -> anyhow::Result<Self> {
+        let endpoint = std::env::var("HELIUS_SENDER_ENDPOINT")
+            .unwrap_or_else(|_| "https://sender.helius-rpc.com/fast?swqos_only=true".into());
+        let endpoint_mode = helius_sender_endpoint_mode(&endpoint);
+        let tip_lamports = env_u64("HELIUS_SENDER_TIP_LAMPORTS", 5_000);
+        validate_sender_tip(endpoint_mode, tip_lamports)?;
+        Ok(Self {
+            endpoint,
+            endpoint_mode,
+            tip_lamports,
+            cu_limit: env_u64("HELIUS_SENDER_CU_LIMIT", 250_000).clamp(50_000, 1_400_000) as u32,
+            cu_price_micro_lamports: env_u64("HELIUS_SENDER_CU_PRICE_MICRO_LAMPORTS", 200_000),
+        })
+    }
+}
+
+pub fn helius_sender_endpoint_mode(endpoint: &str) -> HeliusSenderEndpointMode {
+    if endpoint.to_ascii_lowercase().contains("swqos_only=true") {
+        HeliusSenderEndpointMode::SwqosOnly
+    } else {
+        HeliusSenderEndpointMode::Dual
+    }
+}
+
+pub fn validate_sender_tip(
+    mode: HeliusSenderEndpointMode,
+    tip_lamports: u64,
+) -> anyhow::Result<()> {
+    let min = match mode {
+        HeliusSenderEndpointMode::SwqosOnly => 5_000,
+        HeliusSenderEndpointMode::Dual => 200_000,
+    };
+    if tip_lamports < min {
+        anyhow::bail!(
+            "HELIUS_SENDER_TIP_LAMPORTS too low for {}: {} < {}",
+            mode.as_str(),
+            tip_lamports,
+            min
+        );
+    }
+    Ok(())
+}
+
+pub fn helius_sender_max_per_day() -> usize {
+    env_u64("HELIUS_SENDER_MAX_PER_DAY", 2).clamp(0, 10) as usize
+}
+
+pub fn wrap_sender_instructions(
+    ixs: &[Instruction],
+    payer: &Keypair,
+    cfg: &HeliusSenderConfig,
+) -> anyhow::Result<Vec<Instruction>> {
+    if ixs.is_empty() {
+        anyhow::bail!("helius_sender_empty_instruction_set");
+    }
+    let mut out = Vec::with_capacity(ixs.len() + 3);
+    out.push(ComputeBudgetInstruction::set_compute_unit_limit(
+        cfg.cu_limit,
+    ));
+    out.push(ComputeBudgetInstruction::set_compute_unit_price(
+        cfg.cu_price_micro_lamports,
+    ));
+    out.extend(ixs.iter().cloned());
+    out.push(solana_sdk::system_instruction::transfer(
+        &payer.pubkey(),
+        &sender_tip_account_for_seed(&ixs[0].program_id.to_string())?,
+        cfg.tip_lamports,
+    ));
+    Ok(out)
+}
+
+pub fn sender_tip_account_for_seed(seed: &str) -> anyhow::Result<Pubkey> {
+    let accounts = sender_tip_accounts();
+    let sum = seed
+        .bytes()
+        .fold(0usize, |acc, b| acc.wrapping_add(b as usize));
+    Pubkey::from_str(accounts[sum % accounts.len()]).map_err(|e| anyhow::anyhow!(e))
+}
+
+pub fn sender_tip_accounts() -> &'static [&'static str] {
+    &[
+        "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE",
+        "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
+        "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta",
+        "5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn",
+        "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD",
+        "2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ",
+        "wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF",
+        "3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT",
+        "4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey",
+        "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7hsFNap8pVN3Ey",
+    ]
+}
+
+fn sanitize_sender_error(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || " .,:;_=-/()".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .chars()
+        .take(240)
+        .collect()
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 fn tx_terminal_status_from_error(error: Option<String>) -> TxTerminalStatus {
     match error {
         Some(err) => TxTerminalStatus::Failed(err),
@@ -208,6 +408,7 @@ fn tx_terminal_status_from_optional_error(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LiveSendBackend {
     Rpc,
+    HeliusSender,
     PumpPortalLightningLater,
 }
 
@@ -215,6 +416,7 @@ impl LiveSendBackend {
     fn as_str(self) -> &'static str {
         match self {
             Self::Rpc => "rpc",
+            Self::HeliusSender => "helius_sender",
             Self::PumpPortalLightningLater => "pumpportal_lightning_later",
         }
     }
@@ -226,6 +428,7 @@ fn live_send_backend() -> LiveSendBackend {
 
 fn live_send_backend_from_env_value(value: Option<&str>) -> LiveSendBackend {
     match value.unwrap_or("rpc").to_ascii_lowercase().as_str() {
+        "helius_sender" => LiveSendBackend::HeliusSender,
         "pumpportal_lightning_later" => LiveSendBackend::PumpPortalLightningLater,
         _ => LiveSendBackend::Rpc,
     }
@@ -310,11 +513,12 @@ fn is_retryable_blockhash_error(error: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        commitment_label, is_preflight_6004_error, is_retryable_blockhash_error,
-        live_send_backend_from_env_value, live_send_preflight_attempts,
-        live_send_preflight_commitment_level_from_env_value, live_send_rpc_max_retries,
-        live_send_rpc_url_from_env_value, tx_terminal_status_from_optional_error, LiveSendBackend,
-        TxTerminalStatus,
+        commitment_label, helius_sender_endpoint_mode, is_preflight_6004_error,
+        is_retryable_blockhash_error, live_send_backend_from_env_value,
+        live_send_preflight_attempts, live_send_preflight_commitment_level_from_env_value,
+        live_send_rpc_max_retries, live_send_rpc_url_from_env_value, sender_tip_account_for_seed,
+        tx_terminal_status_from_optional_error, validate_sender_tip, wrap_sender_instructions,
+        HeliusSenderConfig, HeliusSenderEndpointMode, LiveSendBackend, TxTerminalStatus,
     };
     use solana_sdk::commitment_config::CommitmentLevel;
     use std::sync::Mutex;
@@ -442,5 +646,50 @@ mod tests {
         std::env::set_var("LIVE_SEND_RPC_MAX_RETRIES", "bad");
         assert_eq!(live_send_rpc_max_retries(), 0);
         std::env::remove_var("LIVE_SEND_RPC_MAX_RETRIES");
+    }
+    #[test]
+    fn sender_backend_and_endpoint_mode_are_parsed() {
+        assert_eq!(
+            live_send_backend_from_env_value(Some("helius_sender")),
+            LiveSendBackend::HeliusSender
+        );
+        assert_eq!(
+            helius_sender_endpoint_mode("https://sender.helius-rpc.com/fast?swqos_only=true"),
+            HeliusSenderEndpointMode::SwqosOnly
+        );
+        assert_eq!(
+            helius_sender_endpoint_mode("https://sender.helius-rpc.com/fast"),
+            HeliusSenderEndpointMode::Dual
+        );
+    }
+
+    #[test]
+    fn sender_tip_validation_enforces_mode_minimums() {
+        assert!(validate_sender_tip(HeliusSenderEndpointMode::SwqosOnly, 5_000).is_ok());
+        assert!(validate_sender_tip(HeliusSenderEndpointMode::SwqosOnly, 4_999).is_err());
+        assert!(validate_sender_tip(HeliusSenderEndpointMode::Dual, 200_000).is_ok());
+        assert!(validate_sender_tip(HeliusSenderEndpointMode::Dual, 199_999).is_err());
+    }
+
+    #[test]
+    fn sender_wrapper_adds_compute_budget_and_tip() {
+        let payer = solana_sdk::signature::Keypair::new();
+        let original = solana_sdk::instruction::Instruction {
+            program_id: solana_sdk::pubkey::Pubkey::new_unique(),
+            accounts: vec![],
+            data: vec![1, 2, 3],
+        };
+        let cfg = HeliusSenderConfig {
+            endpoint: "https://sender.helius-rpc.com/fast?swqos_only=true".into(),
+            endpoint_mode: HeliusSenderEndpointMode::SwqosOnly,
+            tip_lamports: 5_000,
+            cu_limit: 250_000,
+            cu_price_micro_lamports: 200_000,
+        };
+        let wrapped = wrap_sender_instructions(&[original.clone()], &payer, &cfg).unwrap();
+        assert_eq!(wrapped.len(), 4);
+        assert_eq!(wrapped[2].program_id, original.program_id);
+        assert_eq!(wrapped[3].program_id, solana_sdk::system_program::id());
+        assert!(sender_tip_account_for_seed("abc").is_ok());
     }
 }
