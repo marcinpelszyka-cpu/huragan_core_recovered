@@ -285,7 +285,7 @@ async fn main() -> anyhow::Result<()> {
                         stability.max_quote_reserve_drop_bps,
                         stability.max_buy_quote_drop_bps
                     ));
-                    let state = live_position_state(
+                    let mut state = live_position_state(
                         &live_variant,
                         &target,
                         &plan,
@@ -294,6 +294,7 @@ async fn main() -> anyhow::Result<()> {
                         String::new(),
                         &reason,
                     );
+                    apply_live_entry_stability_state(&mut state, &stability);
                     if let Err(save_err) = ledger.save_new_position(&state) {
                         eprintln!(
                             "⚠️ LIVE ENTRY GATE STATE SAVE FAILED for {}: {save_err}",
@@ -335,7 +336,7 @@ async fn main() -> anyhow::Result<()> {
                         );
                         match executor.wait_terminal_status(&sig, 10).await? {
                             TxTerminalStatus::Confirmed => {
-                                let state = live_position_state(
+                                let mut state = live_position_state(
                                     &live_variant,
                                     &target,
                                     &plan,
@@ -344,6 +345,7 @@ async fn main() -> anyhow::Result<()> {
                                     sig.to_string(),
                                     "",
                                 );
+                                apply_live_entry_stability_state(&mut state, &stability);
                                 if let Err(e) = ledger.save_new_position(&state) {
                                     eprintln!(
                                         "⚠️ LIVE STATE SAVE FAILED for {} sig={}: {e}",
@@ -592,6 +594,25 @@ fn live_position_state(
         excluded_from_stats: failed,
         ..Default::default()
     }
+}
+
+fn apply_live_entry_stability_state(
+    state: &mut PositionState,
+    stability: &engine::LiveEntryStabilityDecision,
+) {
+    state.min_quote_reserve_raw = if state.min_quote_reserve_raw == 0 {
+        stability.min_quote_reserve_raw
+    } else if stability.min_quote_reserve_raw == 0 {
+        state.min_quote_reserve_raw
+    } else {
+        state.min_quote_reserve_raw.min(stability.min_quote_reserve_raw)
+    };
+    state.quote_reserve_raw = stability
+        .samples
+        .last()
+        .map(|s| s.quote_reserve_raw)
+        .unwrap_or(state.quote_reserve_raw);
+    state.quote_reserve_ui = state.quote_reserve_raw as f64 / 1e9;
 }
 
 fn sanitize_live_error(error: &str) -> String {
