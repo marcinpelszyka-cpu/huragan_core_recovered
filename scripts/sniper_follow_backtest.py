@@ -239,16 +239,24 @@ def extract_mint_trade_events(row, mint, first_block_time, entry_market_cap_sol=
         actor = owner or signer
         if not actor:
             continue
+        # V1 follows the wallet that actually signed the trade. Pool/bonding-curve
+        # vault token accounts also change balance in the same transaction and have
+        # the opposite delta; counting them as wallets creates fake dumpers.
+        if owner and signer and owner != signer:
+            continue
         side = "buy" if delta > 0 else "sell"
         native_delta = native_sol_delta_for(tx, signer)
         quote_delta_sol = abs(native_delta) if native_delta else 0.0
+        block_time = bt
         events.append({
             "mint": mint,
-            "timestamp": bt,
-            "age_secs": max(0, bt - first_block_time) if first_block_time else 0,
+            "timestamp": block_time,
+            "block_time": block_time,
+            "age_secs": max(0, block_time - first_block_time) if first_block_time else 0,
             "signature": tx_signature(row),
             "signer": signer,
             "owner": actor,
+            "owner_matches_signer": bool(actor == signer),
             "token_account": account,
             "side": side,
             "token_delta_raw": abs(delta),

@@ -271,6 +271,9 @@ fn extract_trade_events(mint: &str, first_seen_unix: i64, rows: &[Value]) -> Vec
             if before == after {
                 continue;
             }
+            if !owner.is_empty() && !signer.is_empty() && owner != signer {
+                continue;
+            }
             let side = if after > before { "buy" } else { "sell" };
             out.push(ShadowTradeEvent {
                 owner: if owner.is_empty() { signer.clone() } else { owner },

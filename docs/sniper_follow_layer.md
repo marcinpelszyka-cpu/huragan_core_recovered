@@ -15,6 +15,8 @@ Warstwa identyfikuje portfele, które kupują fresh tokeny w pierwszych sekundac
   - `postBalances`
   - signer / owner token account
 
+V1 liczy tylko token balance deltas, gdzie `owner == signer`. To celowo odcina pool/bonding-curve vaults, które zmieniają saldo w tej samej transakcji i tworzą fałszywy obraz dumpowania.
+
 Nie dodajemy Helius Rust SDK do core w v1, bo projekt używa `solana-client = 2`; SDK może wymagać innego stacku Solany. Aktualny v1 używa deterministycznego JSON-RPC przez `reqwest` / Python `urllib`.
 
 ## Backtest
