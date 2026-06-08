@@ -13,3 +13,5 @@ fresh_momentum_candidates.jsonl
 fresh_raw_events.jsonl
 helius_unparsed_transactions.jsonl
 helius_buy_samples.jsonl
+.ops_lock.json
+OPERATOR_STATE.md
