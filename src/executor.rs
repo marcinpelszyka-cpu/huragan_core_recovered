@@ -277,7 +277,7 @@ pub struct HeliusSenderConfig {
 impl HeliusSenderConfig {
     pub fn from_env() -> anyhow::Result<Self> {
         let endpoint = std::env::var("HELIUS_SENDER_ENDPOINT")
-            .unwrap_or_else(|_| "https://sender.helius-rpc.com/fast?swqos_only=true".into());
+            .unwrap_or_else(|_| "http://fra-sender.helius-rpc.com/fast?swqos_only=true".into());
         let endpoint_mode = helius_sender_endpoint_mode(&endpoint);
         let tip_lamports = env_u64("HELIUS_SENDER_TIP_LAMPORTS", 5_000);
         validate_sender_tip(endpoint_mode, tip_lamports)?;
@@ -365,7 +365,7 @@ pub fn sender_tip_accounts() -> &'static [&'static str] {
         "wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF",
         "3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT",
         "4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey",
-        "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7hsFNap8pVN3Ey",
+        "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or",
     ]
 }
 
@@ -654,11 +654,11 @@ mod tests {
             LiveSendBackend::HeliusSender
         );
         assert_eq!(
-            helius_sender_endpoint_mode("https://sender.helius-rpc.com/fast?swqos_only=true"),
+            helius_sender_endpoint_mode("http://fra-sender.helius-rpc.com/fast?swqos_only=true"),
             HeliusSenderEndpointMode::SwqosOnly
         );
         assert_eq!(
-            helius_sender_endpoint_mode("https://sender.helius-rpc.com/fast"),
+            helius_sender_endpoint_mode("http://fra-sender.helius-rpc.com/fast"),
             HeliusSenderEndpointMode::Dual
         );
     }
@@ -680,7 +680,7 @@ mod tests {
             data: vec![1, 2, 3],
         };
         let cfg = HeliusSenderConfig {
-            endpoint: "https://sender.helius-rpc.com/fast?swqos_only=true".into(),
+            endpoint: "http://fra-sender.helius-rpc.com/fast?swqos_only=true".into(),
             endpoint_mode: HeliusSenderEndpointMode::SwqosOnly,
             tip_lamports: 5_000,
             cu_limit: 250_000,

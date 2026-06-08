@@ -23,7 +23,7 @@ Docs: https://www.helius.dev/docs/sending-transactions/sender
 
 ```env
 LIVE_SEND_BACKEND=helius_sender
-HELIUS_SENDER_ENDPOINT=https://sender.helius-rpc.com/fast?swqos_only=true
+HELIUS_SENDER_ENDPOINT=http://fra-sender.helius-rpc.com/fast?swqos_only=true
 HELIUS_SENDER_TIP_LAMPORTS=5000
 HELIUS_SENDER_CU_LIMIT=250000
 HELIUS_SENDER_CU_PRICE_MICRO_LAMPORTS=200000
