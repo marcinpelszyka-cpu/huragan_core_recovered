@@ -1,363 +1,521 @@
 #!/usr/bin/env python3
-"""Sniper Follow Backtest — backfill sniper trade events via Helius getTransactionsForAddress.
+"""Fresh sniper follow backtest/shadow dataset builder.
 
-Phase 1: data collection.
-Phase 2: sniper detection.
-Phase 3: wallet ranking (separate script).
-
-Environment:
-  Requires Helius RPC key from /opt/huragan_core/.env (RPC_SEND_URL or RPC_URL).
-  No live execution. Read-only.
-
-Usage:
-  python3 scripts/sniper_follow_backtest.py [--limit N] [--self-test]
+Shadow/backfill only: reads Helius RPC data and local PumpPortal fresh candidates;
+never signs or sends transactions.
 """
-
 import argparse
+import csv
 import json
+import math
 import os
 import sys
 import time
+import urllib.request
 from collections import defaultdict
 from pathlib import Path
-from urllib import request, error as urllib_error
 
-PROJECT = Path(__file__).resolve().parent.parent
-STATE = PROJECT / "state.jsonl"
-OUT = PROJECT / "datasets" / "sniper_trade_events.jsonl"
-
-# Solana system accounts to exclude
-SYSTEM_ACCOUNTS = {
-    "11111111111111111111111111111111",
-    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
-    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
-    "So11111111111111111111111111111111111111112",  # WSOL mint
-    "ComputeBudget111111111111111111111111111111",
-    "Sysvar1111111111111111111111111111111111111",
-    "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
-}
-
-PUMP_AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+WSOL_MINT = "So11111111111111111111111111111111111111112"
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+DEFAULT_OUT_EVENTS = "datasets/sniper_trade_events.jsonl"
+DEFAULT_OUT_SCORES = "datasets/sniper_wallet_scores.csv"
+DEFAULT_OUT_SIGNALS = "datasets/sniper_follow_signals.jsonl"
+DEFAULT_ERRORS = "datasets/sniper_follow_errors.jsonl"
 
 
-def load_api_key():
-    env_path = PROJECT / ".env"
+def load_dotenv_value(key, default=""):
+    val = os.environ.get(key)
+    if val:
+        return val
+    env_path = Path(".env")
     if not env_path.exists():
-        sys.exit("FATAL: .env not found")
-    env = {}
-    for line in env_path.read_text(errors="ignore").splitlines():
-        if "=" in line and not line.strip().startswith("#"):
+        return default
+    try:
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
             k, v = line.split("=", 1)
-            env[k.strip()] = v.strip().strip('"').strip("'")
-    for key_var in ("RPC_SEND_URL", "RPC_URL"):
-        url = env.get(key_var, "")
-        for sep in ("?api-key=", "&api-key="):
-            if sep in url:
-                return url.split(sep)[1].split("&")[0]
-    sys.exit("FATAL: no api-key found in RPC_SEND_URL or RPC_URL")
+            if k.strip() == key:
+                return v.strip().strip('"').strip("'")
+    except Exception:
+        return default
+    return default
 
 
-def rpc_call(api_key, method, params=None):
-    url = f"https://beta.helius-rpc.com/?api-key={api_key}"
-    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []})
-    req = request.Request(url, body.encode(), {"Content-Type": "application/json"})
-    with request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read())
+def fnum(v, default=0.0):
+    try:
+        if v is None or v == "":
+            return default
+        x = float(v)
+        if math.isnan(x) or math.isinf(x):
+            return default
+        return x
+    except Exception:
+        return default
 
 
-def gfta(api_key, address, before_sig=None, limit=1000):
-    """Fetch transactions for an address using getTransactionsForAddress."""
-    params = [
-        address,
-        {
-            "transactionDetails": "full",
-            "sortOrder": "desc",
-            "limit": min(limit, 1000),
-            "filters": {"status": "succeeded"},
-            "encoding": "jsonParsed",
-            "maxSupportedTransactionVersion": 0,
-        },
-    ]
-    if before_sig:
-        params[1]["filters"]["signature"] = {"lt": before_sig}
-    return rpc_call(api_key, "getTransactionsForAddress", params)
+def inum(v, default=0):
+    try:
+        if v is None or v == "":
+            return default
+        return int(float(v))
+    except Exception:
+        return default
 
 
-def parse_token_deltas(tx_data) -> list[dict]:
-    """Extract per-wallet token balance changes from pre/post token balances."""
-    meta = tx_data.get("meta", {})
-    pre = meta.get("preTokenBalances", []) or []
-    post = meta.get("postTokenBalances", []) or []
-    if not pre and not post:
+def read_jsonl(path):
+    path = Path(path)
+    if not path.exists():
         return []
+    rows = []
+    with path.open() as f:
+        for i, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception as e:
+                print(f"WARN bad_json path={path} line={i}: {e}", file=sys.stderr)
+    return rows
 
-    # Build lookup: (accountIndex, mint) -> {pre_amount, post_amount, owner}
-    lookup = {}
-    for entry in pre:
-        key = (entry.get("accountIndex"), entry.get("mint"))
-        owner = entry.get("owner", "")
-        lookup[key] = {"pre": float(entry.get("uiTokenAmount", {}).get("amount", 0)), "owner": owner}
-    for entry in post:
-        key = (entry.get("accountIndex"), entry.get("mint"))
-        owner = entry.get("owner", "")
-        amt = float(entry.get("uiTokenAmount", {}).get("amount", 0))
-        if key in lookup:
-            lookup[key]["post"] = amt
-            if not lookup[key].get("owner"):
-                lookup[key]["owner"] = owner
-        else:
-            lookup[key] = {"pre": 0.0, "post": amt, "owner": owner}
 
-    deltas = []
-    for (idx, mint), vals in lookup.items():
-        pre_amt = vals.get("pre", 0.0)
-        post_amt = vals.get("post", 0.0)
-        delta = post_amt - pre_amt
-        owner = vals.get("owner", "")
-        if delta == 0 or not owner:
+def write_jsonl(path, rows):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        for row in rows:
+            f.write(json.dumps(row, separators=(",", ":"), ensure_ascii=False) + "\n")
+
+
+def append_jsonl(path, row):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        f.write(json.dumps(row, separators=(",", ":"), ensure_ascii=False) + "\n")
+
+
+class Rpc:
+    def __init__(self, url, sleep_s=0.0):
+        self.url = url
+        self.sleep_s = sleep_s
+        self.calls = 0
+
+    def call(self, method, params):
+        self.calls += 1
+        if self.sleep_s:
+            time.sleep(self.sleep_s)
+        body = json.dumps({"jsonrpc": "2.0", "id": self.calls, "method": method, "params": params}).encode()
+        req = urllib.request.Request(self.url, data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            out = json.load(resp)
+        if out.get("error"):
+            raise RuntimeError(f"rpc_error:{out['error']}")
+        return out.get("result")
+
+
+def gtfa_fetch(rpc, address, *, start_time=None, end_time=None, limit=1000, max_pages=1):
+    rows = []
+    token = None
+    for _ in range(max_pages):
+        opts = {
+            "transactionDetails": "full",
+            "sortOrder": "asc",
+            "limit": limit,
+            "filters": {"status": "succeeded"},
+        }
+        if start_time is not None or end_time is not None:
+            block_time = {}
+            if start_time is not None:
+                block_time["gte"] = int(start_time)
+            if end_time is not None:
+                block_time["lte"] = int(end_time)
+            opts["filters"]["blockTime"] = block_time
+        if token:
+            opts["paginationToken"] = token
+        res = rpc.call("getTransactionsForAddress", [address, opts]) or {}
+        data = res.get("data") if isinstance(res, dict) else res
+        if not data:
+            break
+        rows.extend(data)
+        token = res.get("paginationToken") if isinstance(res, dict) else None
+        if not token:
+            break
+    return rows
+
+
+def unwrap_tx(row):
+    if not isinstance(row, dict):
+        return {}
+    if "nativeTransaction" in row and isinstance(row.get("nativeTransaction"), dict):
+        return row.get("nativeTransaction") or {}
+    return row
+
+
+def tx_signature(row):
+    tx = unwrap_tx(row)
+    return (
+        row.get("signature")
+        or row.get("transactionSignature")
+        or (((tx.get("transaction") or {}).get("signatures") or [None])[0])
+        or ""
+    )
+
+
+def tx_block_time(row):
+    tx = unwrap_tx(row)
+    return inum(row.get("blockTime") or row.get("timestamp") or tx.get("blockTime"), 0)
+
+
+def account_key_info(key):
+    if isinstance(key, str):
+        return {"pubkey": key, "signer": False}
+    if isinstance(key, dict):
+        return {"pubkey": key.get("pubkey") or key.get("account") or "", "signer": bool(key.get("signer"))}
+    return {"pubkey": "", "signer": False}
+
+
+def account_keys(tx):
+    msg = (((tx.get("transaction") or {}).get("message") or {}) if isinstance(tx, dict) else {})
+    return [account_key_info(k) for k in (msg.get("accountKeys") or [])]
+
+
+def primary_signer(tx):
+    keys = account_keys(tx)
+    for k in keys:
+        if k.get("signer") and k.get("pubkey"):
+            return k["pubkey"]
+    return keys[0]["pubkey"] if keys else ""
+
+
+def native_sol_delta_for(tx, pubkey):
+    keys = account_keys(tx)
+    idx = next((i for i, k in enumerate(keys) if k.get("pubkey") == pubkey), -1)
+    if idx < 0:
+        return 0.0
+    meta = tx.get("meta") or {}
+    pre = meta.get("preBalances") or []
+    post = meta.get("postBalances") or []
+    if idx >= len(pre) or idx >= len(post):
+        return 0.0
+    return (fnum(post[idx]) - fnum(pre[idx])) / 1e9
+
+
+def raw_token_amount(balance):
+    amt = (balance.get("uiTokenAmount") or {}).get("amount")
+    return inum(amt, 0)
+
+
+def token_balance_maps(tx, field):
+    keys = account_keys(tx)
+    out = {}
+    for b in (tx.get("meta") or {}).get(field) or []:
+        idx = inum(b.get("accountIndex"), -1)
+        account = keys[idx]["pubkey"] if 0 <= idx < len(keys) else b.get("account") or ""
+        owner = b.get("owner") or ""
+        mint = b.get("mint") or ""
+        out[(account, mint, owner)] = raw_token_amount(b)
+    return out
+
+
+def extract_mint_trade_events(row, mint, first_block_time, entry_market_cap_sol=0.0):
+    tx = unwrap_tx(row)
+    bt = tx_block_time(row)
+    if not bt:
+        return []
+    signer = primary_signer(tx)
+    pre = token_balance_maps(tx, "preTokenBalances")
+    post = token_balance_maps(tx, "postTokenBalances")
+    keys = set(pre.keys()) | set(post.keys())
+    events = []
+    for key in keys:
+        account, bal_mint, owner = key
+        if bal_mint != mint:
             continue
-        if owner in SYSTEM_ACCOUNTS or mint in SYSTEM_ACCOUNTS:
+        delta = post.get(key, 0) - pre.get(key, 0)
+        if delta == 0:
+            continue
+        actor = owner or signer
+        if not actor:
             continue
         side = "buy" if delta > 0 else "sell"
-        deltas.append({
-            "account_index": idx,
+        native_delta = native_sol_delta_for(tx, signer)
+        quote_delta_sol = abs(native_delta) if native_delta else 0.0
+        events.append({
             "mint": mint,
-            "owner": owner,
-            "token_delta_raw": abs(delta),
+            "timestamp": bt,
+            "age_secs": max(0, bt - first_block_time) if first_block_time else 0,
+            "signature": tx_signature(row),
+            "signer": signer,
+            "owner": actor,
+            "token_account": account,
             "side": side,
+            "token_delta_raw": abs(delta),
+            "quote_delta_sol": round(quote_delta_sol, 12),
+            "entry_market_cap_sol": entry_market_cap_sol,
         })
-    return deltas
-
-
-def parse_sol_deltas(tx_data) -> dict[int, float]:
-    """Extract SOL balance changes from pre/post balances (non-token)."""
-    meta = tx_data.get("meta", {})
-    pre_bal = meta.get("preBalances", []) or []
-    post_bal = meta.get("postBalances", []) or []
-    deltas = {}
-    for i in range(max(len(pre_bal), len(post_bal))):
-        pre = pre_bal[i] if i < len(pre_bal) else 0
-        post = post_bal[i] if i < len(post_bal) else 0
-        delta = post - pre
-        if delta != 0:
-            deltas[i] = delta / 1e9
-    return deltas
-
-
-def pool_vaults_from_state(pool_state: str) -> tuple[str, str]:
-    """Return (base_vault, quote_vault) from state.jsonl for a given pool_state."""
-    if not STATE.exists():
-        return "", ""
-    with open(STATE) as f:
-        for line in f:
-            if pool_state in line and '"pool_state"' in line:
-                try:
-                    r = json.loads(line)
-                    if r.get("pool_state") == pool_state:
-                        return r.get("pool_base_token_account", ""), r.get("pool_quote_token_account", "")
-                except Exception:
-                    continue
-    return "", ""
-
-
-def is_pool_vault(owner: str, pool_state: str, base_vault: str, quote_vault: str) -> bool:
-    return owner in (pool_state, base_vault, quote_vault)
-
-
-def process_pool(api_key, pool_state, mint, base_vault, quote_vault, max_tx=500):
-    """Process one pool: fetch transactions, extract buy/sell events."""
-    events = []
-    seen_txs = set()
-    before_sig = None
-    fetched = 0
-
-    while fetched < max_tx:
-        try:
-            resp = gfta(api_key, pool_state, before_sig=before_sig, limit=min(1000, max_tx - fetched))
-        except urllib_error.HTTPError as e:
-            print(f"  HTTP {e.code} for {pool_state[:12]}", file=sys.stderr)
-            break
-        except Exception as e:
-            print(f"  Error: {e}", file=sys.stderr)
-            break
-
-        txs = resp.get("result", {}).get("data", [])
-        if not txs:
-            break
-
-        for tx in txs:
-            sig = tx.get("signature", "")
-            if sig in seen_txs:
-                continue
-            seen_txs.add(sig)
-
-            slot = tx.get("slot", 0)
-            block_time = tx.get("blockTime")
-            token_deltas = parse_token_deltas(tx)
-            sol_deltas = parse_sol_deltas(tx)
-
-            for td in token_deltas:
-                owner = td["owner"]
-                if is_pool_vault(owner, pool_state, base_vault, quote_vault):
-                    continue
-                sol_delta = sol_deltas.get(td["account_index"], 0.0)
-                events.append({
-                    "mint": td["mint"] if td["mint"] != "So11111111111111111111111111111111111111112" else mint,
-                    "pool_state": pool_state,
-                    "signature": sig,
-                    "slot": slot,
-                    "block_time": block_time,
-                    "owner": owner,
-                    "token_delta_raw": td["token_delta_raw"],
-                    "quote_delta_sol": abs(sol_delta) if sol_delta != 0 else 0.0,
-                    "side": td["side"],
-                })
-
-        fetched += len(txs)
-        if len(txs) < 100:
-            break
-        # Paginate: use last signature as cursor
-        before_sig = txs[-1].get("signature")
-        time.sleep(0.15)  # rate limit
-
     return events
 
 
-def load_completed_pools(limit=20):
-    """Load pools from state.jsonl that had a terminal Z3 lifecycle."""
-    if not STATE.exists():
-        return []
-    latest = {}
-    with open(STATE) as f:
-        for line in f:
-            if "pool_state" not in line:
-                continue
-            try:
-                r = json.loads(line)
-            except Exception:
-                continue
-            ps = r.get("pool_state", "")
-            if not ps:
-                continue
-            latest[ps] = r
+def classify_wallet(sample_count, win_rate, avg_pnl_sol, fast_dump_rate, avg_hold_ratio_60s, dev_suspect_rate):
+    if sample_count <= 0:
+        return "UNKNOWN"
+    if dev_suspect_rate >= 0.5 and sample_count >= 2:
+        return "DEV_SNIPER_SUSPECT"
+    if fast_dump_rate >= 0.5 and sample_count >= 2:
+        return "FAST_DUMPER"
+    if sample_count >= 3 and win_rate >= 0.55 and avg_pnl_sol > 0 and avg_hold_ratio_60s >= 0.35:
+        return "GOOD_SNIPER"
+    return "UNKNOWN"
 
-    pools = []
-    for ps, r in latest.items():
-        status = r.get("status", "")
-        if status not in ("completed", "unrecoverable_dust_or_rug", "live_failed"):
+
+def score_wallets(events, early_window_secs=10, dump_window_secs=30):
+    by_wallet_mint = defaultdict(list)
+    for e in events:
+        wallet = e.get("owner") or e.get("signer") or ""
+        if wallet:
+            by_wallet_mint[(wallet, e["mint"])].append(e)
+
+    per_wallet = defaultdict(list)
+    for (wallet, mint), rows in by_wallet_mint.items():
+        rows = sorted(rows, key=lambda r: (r.get("timestamp", 0), r.get("signature", "")))
+        buys = [r for r in rows if r["side"] == "buy"]
+        sells = [r for r in rows if r["side"] == "sell"]
+        first_buy = min((r["age_secs"] for r in buys), default=None)
+        if first_buy is None or first_buy > early_window_secs:
             continue
-        mint = r.get("mint", "") or r.get("quote_mint", "")
+        bought = sum(r["token_delta_raw"] for r in buys)
+        sold = sum(r["token_delta_raw"] for r in sells)
+        bought_sol = sum(r["quote_delta_sol"] for r in buys)
+        sold_sol = sum(r["quote_delta_sol"] for r in sells)
+        sold_fast = sum(r["token_delta_raw"] for r in sells if r["age_secs"] <= dump_window_secs)
+        hold_ratio = max(0.0, (bought - sold) / bought) if bought > 0 else 0.0
+        fast_dump_ratio = sold_fast / bought if bought > 0 else 0.0
+        pnl = sold_sol - bought_sol
+        # Funding graph is not available in this V1 dataset. Keep this explicit.
+        dev_suspect = False
+        per_wallet[wallet].append({
+            "mint": mint,
+            "first_buy_age_secs": first_buy,
+            "buy_sol": bought_sol,
+            "sell_sol": sold_sol,
+            "pnl_sol": pnl,
+            "hold_ratio_60s": hold_ratio,
+            "fast_dump_ratio_30s": fast_dump_ratio,
+            "dev_suspect": dev_suspect,
+        })
+
+    scores = []
+    for wallet, rows in per_wallet.items():
+        sample_count = len(rows)
+        wins = sum(1 for r in rows if r["pnl_sol"] > 0)
+        win_rate = wins / sample_count if sample_count else 0.0
+        avg_pnl = sum(r["pnl_sol"] for r in rows) / sample_count if sample_count else 0.0
+        fast_dump_rate = sum(1 for r in rows if r["fast_dump_ratio_30s"] >= 0.5) / sample_count if sample_count else 0.0
+        avg_hold = sum(r["hold_ratio_60s"] for r in rows) / sample_count if sample_count else 0.0
+        dev_rate = sum(1 for r in rows if r["dev_suspect"]) / sample_count if sample_count else 0.0
+        cls = classify_wallet(sample_count, win_rate, avg_pnl, fast_dump_rate, avg_hold, dev_rate)
+        scores.append({
+            "wallet": wallet,
+            "classification": cls,
+            "sample_count": sample_count,
+            "win_rate": round(win_rate, 6),
+            "avg_pnl_sol": round(avg_pnl, 12),
+            "fast_dump_rate": round(fast_dump_rate, 6),
+            "avg_hold_ratio_60s": round(avg_hold, 6),
+            "dev_sniper_suspect_rate": round(dev_rate, 6),
+        })
+    scores.sort(key=lambda r: (r["classification"] != "GOOD_SNIPER", -r["sample_count"], -r["avg_pnl_sol"], r["wallet"]))
+    return scores
+
+
+def build_signals(events, scores, *, early_window_secs=10, min_buy_sol=0.01, min_good_snipers=2, min_total_buy_sol=0.03, min_hold_ratio=0.75):
+    class_by_wallet = {r["wallet"]: r["classification"] for r in scores}
+    by_mint = defaultdict(list)
+    for e in events:
+        by_mint[e["mint"]].append(e)
+    signals = []
+    for mint, rows in sorted(by_mint.items()):
+        early_buys = [
+            r for r in rows
+            if r["side"] == "buy" and r["age_secs"] <= early_window_secs and r["quote_delta_sol"] >= min_buy_sol
+        ]
+        good = [r for r in early_buys if class_by_wallet.get(r.get("owner") or r.get("signer"), "UNKNOWN") == "GOOD_SNIPER"]
+        good_wallets = sorted({r.get("owner") or r.get("signer") for r in good if r.get("owner") or r.get("signer")})
+        total_buy = sum(r["quote_delta_sol"] for r in good)
+        bought_by_good = sum(r["token_delta_raw"] for r in good)
+        sold_by_good_10s = sum(
+            r["token_delta_raw"]
+            for r in rows
+            if r["side"] == "sell" and r["age_secs"] <= early_window_secs and (r.get("owner") or r.get("signer")) in set(good_wallets)
+        )
+        hold_ratio = max(0.0, (bought_by_good - sold_by_good_10s) / bought_by_good) if bought_by_good else 0.0
+        passed = len(good_wallets) >= min_good_snipers and total_buy >= min_total_buy_sol and hold_ratio >= min_hold_ratio
+        signals.append({
+            "mint": mint,
+            "signal": "FOLLOW_SHADOW" if passed else "NO_SIGNAL",
+            "passed": passed,
+            "age_limit_secs": 60,
+            "early_window_secs": early_window_secs,
+            "target_market_cap_note": "around_3500_if_source_available_else_sol_bucket",
+            "entry_market_cap_sol": next((r.get("entry_market_cap_sol", 0.0) for r in rows if r.get("entry_market_cap_sol", 0.0)), 0.0),
+            "good_sniper_count": len(good_wallets),
+            "good_sniper_wallets": good_wallets[:10],
+            "good_sniper_buy_sol": round(total_buy, 12),
+            "good_sniper_hold_ratio_10s": round(hold_ratio, 6),
+            "reason": "good_snipers_follow" if passed else "insufficient_good_sniper_signal",
+            "live_allowed": False,
+        })
+    return signals
+
+
+def write_scores_csv(path, scores):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = ["wallet", "classification", "sample_count", "win_rate", "avg_pnl_sol", "fast_dump_rate", "avg_hold_ratio_60s", "dev_sniper_suspect_rate"]
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for row in scores:
+            w.writerow({k: row.get(k, "") for k in fields})
+
+
+def fresh_candidates(path):
+    rows = read_jsonl(path)
+    out = []
+    seen = set()
+    for r in rows:
+        mint = r.get("mint") or ""
+        if not mint or mint in seen:
+            continue
+        seen.add(mint)
+        out.append(r)
+    return out
+
+
+def run(args):
+    if not args.rpc_url:
+        if args.dry_run:
+            return {
+                "input": args.input,
+                "processed_mints": 0,
+                "trade_events": 0,
+                "wallet_scores": 0,
+                "shadow_signals": 0,
+                "dry_run": True,
+                "rpc_missing": True,
+                "note": "RPC_URL required for real backfill; dry-run performed config smoke only",
+                "out_events": args.out_events,
+                "out_scores": args.out_scores,
+                "out_signals": args.out_signals,
+                "errors": args.errors,
+            }
+        raise SystemExit("RPC_URL missing; pass --rpc-url or source .env")
+    rpc = Rpc(args.rpc_url, sleep_s=args.rpc_sleep)
+    candidates = fresh_candidates(args.input)
+    events = []
+    processed = 0
+    for row in candidates:
+        if args.limit_mints and processed >= args.limit_mints:
+            break
+        mint = row.get("mint") or ""
         if not mint:
             continue
-        pools.append({
-            "pool_state": ps,
-            "mint": mint,
-            "base_vault": r.get("pool_base_token_account", ""),
-            "quote_vault": r.get("pool_quote_token_account", ""),
-            "status": status,
-            "pnl_sol": r.get("net_pnl_sol", 0) or r.get("realized_pnl_sol", 0),
-        })
-    return sorted(pools, key=lambda p: abs(p.get("pnl_sol", 0)), reverse=True)[:limit]
+        entry_mc = fnum(row.get("marketCapSol") or row.get("entry_market_cap_sol"))
+        first_bt_hint = inum(row.get("blockTime") or row.get("timestamp"), 0)
+        try:
+            start_time = first_bt_hint - 5 if first_bt_hint else None
+            end_time = first_bt_hint + args.max_age_secs if first_bt_hint else None
+            txs = gtfa_fetch(rpc, mint, start_time=start_time, end_time=end_time, limit=args.page_limit, max_pages=args.max_pages)
+            first_bt = first_bt_hint or (tx_block_time(txs[0]) if txs else 0)
+            for tx in txs:
+                events.extend(extract_mint_trade_events(tx, mint, first_bt, entry_mc))
+            processed += 1
+        except Exception as e:
+            append_jsonl(args.errors, {"mode": "sniper_follow", "mint": mint, "reason": str(e)})
+
+    scores = score_wallets(events, args.early_window_secs, args.dump_window_secs)
+    signals = build_signals(
+        events,
+        scores,
+        early_window_secs=args.early_window_secs,
+        min_buy_sol=args.min_buy_sol,
+        min_good_snipers=args.min_good_snipers,
+        min_total_buy_sol=args.min_total_buy_sol,
+        min_hold_ratio=args.min_hold_ratio,
+    )
+
+    if not args.dry_run:
+        write_jsonl(args.out_events, events)
+        write_scores_csv(args.out_scores, scores)
+        write_jsonl(args.out_signals, signals)
+
+    return {
+        "input": args.input,
+        "processed_mints": processed,
+        "trade_events": len(events),
+        "wallet_scores": len(scores),
+        "shadow_signals": sum(1 for s in signals if s.get("passed")),
+        "dry_run": args.dry_run,
+        "out_events": args.out_events,
+        "out_scores": args.out_scores,
+        "out_signals": args.out_signals,
+        "errors": args.errors,
+    }
 
 
 def self_test():
-    print("=== SELF-TEST: sniper_follow_backtest ===")
-    print("Testing token delta parser...")
-
-    # Simulated tx with 2 accounts: SOL vault and sniper wallet
-    fake_tx = {
+    tx = {
+        "blockTime": 100,
+        "signature": "sig1",
+        "transaction": {"message": {"accountKeys": [{"pubkey": "Wallet", "signer": True}, "Ata"]}},
         "meta": {
-            "preTokenBalances": [
-                {"accountIndex": 0, "mint": "So11111111111111111111111111111111111111112", "owner": "PoolVaultAAAA", "uiTokenAmount": {"amount": "85000000000"}},
-                {"accountIndex": 1, "mint": "MintAAAAAAAABBBBBBBBBBBBBBBBCCCCCCCCCCCC", "owner": "Sniper111111", "uiTokenAmount": {"amount": "0"}},
-            ],
-            "postTokenBalances": [
-                {"accountIndex": 0, "mint": "So11111111111111111111111111111111111111112", "owner": "PoolVaultAAAA", "uiTokenAmount": {"amount": "85300000000"}},
-                {"accountIndex": 1, "mint": "MintAAAAAAAABBBBBBBBBBBBBBBBCCCCCCCCCCCC", "owner": "Sniper111111", "uiTokenAmount": {"amount": "500000000000"}},
-            ],
-            "preBalances": [100000000, 5000000000],
-            "postBalances": [97000000, 4997000000],
-        }
+            "preBalances": [10_000_000_000, 0],
+            "postBalances": [9_980_000_000, 0],
+            "preTokenBalances": [{"accountIndex": 1, "mint": "Mint", "owner": "Wallet", "uiTokenAmount": {"amount": "0"}}],
+            "postTokenBalances": [{"accountIndex": 1, "mint": "Mint", "owner": "Wallet", "uiTokenAmount": {"amount": "1000"}}],
+        },
     }
-
-    deltas = parse_token_deltas(fake_tx)
-    # Pool WSOL vault gets filtered (system account), sniper token deltas remain
-    assert len(deltas) >= 1, f"Expected at least 1 delta, got {len(deltas)}"
-    
-    # Sniper buy: tokens increased
-    sniper = [d for d in deltas if d["owner"] == "Sniper111111"]
-    assert len(sniper) == 1, f"Sniper not found: {deltas}"
-    assert sniper[0]["side"] == "buy", f"Expected buy, got {sniper[0]['side']}"
-    assert sniper[0]["token_delta_raw"] == 500000000000
-
-    # WSOL should be filtered (system account via mint)
-    pool_wsol = [d for d in deltas if "So1111" in d.get("mint", "")]
-    assert len(pool_wsol) == 0, f"WSOL mint should be excluded, got {pool_wsol}"
-
-    print("  token delta parser: OK")
-
-    # Test pool vault detection
-    assert is_pool_vault("PoolVaultAAAA", "PoolVaultAAAA", "BaseVault", "QuoteVault") is True
-    assert is_pool_vault("Sniper111111", "PoolVaultAAAA", "BaseVault", "QuoteVault") is False
-    print("  pool vault detection: OK")
-
-    print("ALL SELF-TESTS PASSED")
+    events = extract_mint_trade_events(tx, "Mint", 95, 25.0)
+    assert len(events) == 1
+    assert events[0]["side"] == "buy"
+    assert events[0]["age_secs"] == 5
+    assert abs(events[0]["quote_delta_sol"] - 0.02) < 1e-12
+    scores = score_wallets(events * 3, early_window_secs=10)
+    assert scores and scores[0]["wallet"] == "Wallet"
+    research_scores = [{"wallet": "Wallet", "classification": "GOOD_SNIPER"}]
+    signals = build_signals(events * 3, research_scores, min_good_snipers=1, min_total_buy_sol=0.01)
+    assert signals and signals[0]["passed"] is True
+    print("SELF_TEST_OK")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Sniper Follow Backtest")
-    ap.add_argument("--limit", type=int, default=20, help="Max pools to backfill")
-    ap.add_argument("--self-test", action="store_true", help="Run self-test only")
-    ap.add_argument("--pool-state", type=str, help="Single pool state to analyze")
-    ap.add_argument("--mint", type=str, help="Mint for single-pool mode")
+    ap = argparse.ArgumentParser(description="Build Fresh Sniper Follow shadow/backtest datasets from Helius gTFA.")
+    ap.add_argument("--input", default="fresh_momentum_candidates.jsonl")
+    ap.add_argument("--rpc-url", default=load_dotenv_value("RPC_URL", ""))
+    ap.add_argument("--out-events", default=DEFAULT_OUT_EVENTS)
+    ap.add_argument("--out-scores", default=DEFAULT_OUT_SCORES)
+    ap.add_argument("--out-signals", default=DEFAULT_OUT_SIGNALS)
+    ap.add_argument("--errors", default=DEFAULT_ERRORS)
+    ap.add_argument("--limit-mints", type=int, default=0)
+    ap.add_argument("--page-limit", type=int, default=1000)
+    ap.add_argument("--max-pages", type=int, default=1)
+    ap.add_argument("--max-age-secs", type=int, default=60)
+    ap.add_argument("--early-window-secs", type=int, default=10)
+    ap.add_argument("--dump-window-secs", type=int, default=30)
+    ap.add_argument("--min-buy-sol", type=float, default=0.01)
+    ap.add_argument("--min-good-snipers", type=int, default=2)
+    ap.add_argument("--min-total-buy-sol", type=float, default=0.03)
+    ap.add_argument("--min-hold-ratio", type=float, default=0.75)
+    ap.add_argument("--rpc-sleep", type=float, default=0.0)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
-
     if args.self_test:
         self_test()
         return
-
-    api_key = load_api_key()
-    print(f"Helius API key loaded ({len(api_key)} chars)")
-
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-
-    if args.pool_state and args.mint:
-        pools = [{
-            "pool_state": args.pool_state,
-            "mint": args.mint,
-            "base_vault": "",
-            "quote_vault": "",
-            "status": "manual",
-            "pnl_sol": 0,
-        }]
-    else:
-        pools = load_completed_pools(args.limit)
-
-    print(f"Processing {len(pools)} pools...")
-
-    all_events = []
-    for i, pool in enumerate(pools):
-        ps = pool["pool_state"]
-        mint = pool["mint"]
-        bv, qv = pool.get("base_vault"), pool.get("quote_vault")
-        print(f"[{i+1}/{len(pools)}] Pool {ps[:12]}... mint={mint[:12]}")
-        events = process_pool(api_key, ps, mint, bv or "", qv or "", max_tx=500)
-        all_events.extend(events)
-        print(f"  → {len(events)} events")
-        time.sleep(0.1)
-
-    # Write output
-    with open(OUT, "w") as f:
-        for ev in all_events:
-            f.write(json.dumps(ev) + "\n")
-
-    print(f"\nWrote {len(all_events)} events → {OUT}")
-
-    # Quick stats
-    buyers = len({e["owner"] for e in all_events if e["side"] == "buy"})
-    sellers = len({e["owner"] for e in all_events if e["side"] == "sell"})
-    print(f"Unique buyers: {buyers}, unique sellers: {sellers}")
+    print(json.dumps(run(args), indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

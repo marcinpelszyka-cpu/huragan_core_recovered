@@ -31,6 +31,9 @@ async fn main() -> anyhow::Result<()> {
     if env::var("FRESH_MOMENTUM_CAPTURE").unwrap_or_default() == "only" {
         return fresh_momentum::run_fresh_momentum_daemon().await;
     }
+    if env::var("SNIPER_SHADOW_CAPTURE").unwrap_or_default() == "only" {
+        return sniper_shadow::run_sniper_shadow_daemon().await;
+    }
 
     let paper_mode = env_bool("PAPER_MODE", true);
     let live_armed = env_bool("LIVE_ARMED", false);
