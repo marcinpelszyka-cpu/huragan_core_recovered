@@ -627,8 +627,18 @@ def build_for_mint(rpc, wallet_api, candidate, args, wallet_classes, outcomes):
         by_owner.setdefault(e["owner"], e)
     early_unique = list(by_owner.values())
 
+    funding_buyers = early_unique
+    if args.funding_source_method in {"wallet-api", "hybrid"} and args.max_wallet_api_buyers_per_mint > 0:
+        # Wallet API costs 100 credits/call. Cap lookups to the most relevant
+        # early buyers so smoke tests do not accidentally burn credits on noisy
+        # mints with dozens of small buyers.
+        funding_buyers = sorted(
+            early_unique,
+            key=lambda r: (-fnum(r.get("quote_delta_sol"), 0.0), inum(r.get("timestamp"), 0), r.get("owner", "")),
+        )[: args.max_wallet_api_buyers_per_mint]
+
     edges = []
-    for b in early_unique:
+    for b in funding_buyers:
         buyer = b["owner"]
         buy_time = b["timestamp"]
         funding = funding_source_for_buyer(rpc, wallet_api, buyer, buy_time, args)
@@ -792,6 +802,8 @@ def main():
     ap.add_argument("--helius-api-key-env", default="",
                     help="Env/.env key containing Helius API key for Wallet API. If unset, derives api-key from selected RPC URL.")
     ap.add_argument("--wallet-api-sleep", type=float, default=0.0)
+    ap.add_argument("--max-wallet-api-buyers-per-mint", type=int, default=8,
+                    help="Cap paid Wallet API funded-by lookups per mint in wallet-api/hybrid mode; 0 disables cap.")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()

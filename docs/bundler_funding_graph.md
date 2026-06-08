@@ -65,7 +65,8 @@ python3 scripts/bundler_funding_backtest.py \
   --funding-lookback-min 60 \
   --early-window-sec 10 \
   --rpc-sleep 0.75 \
-  --wallet-api-sleep 0.1
+  --wallet-api-sleep 0.1 \
+  --max-wallet-api-buyers-per-mint 8
 ```
 
 Jeśli API key nie jest w URL, podaj nazwę zmiennej z `.env` bez wpisywania sekretu w CLI:
@@ -95,6 +96,14 @@ wallet_api_funder_type
 wallet_api_funder_name_present
 wallet_api_within_lookback
 ```
+
+Domyślnie `hybrid` ogranicza płatne Wallet API lookupi do 8 buyerów na mint:
+
+```text
+--max-wallet-api-buyers-per-mint 8
+```
+
+To jest celowe. Jeden `funded-by` kosztuje 100 credits, więc pełny run bez limitu może niepotrzebnie przepalić limit na jednym hałaśliwym tokenie.
 
 `fresh_bundle_risk_signals.jsonl` zawiera minimum:
 
