@@ -167,3 +167,41 @@ python3 scripts/bundler_funding_backtest.py --rpc-env-key RPC_SEND_URL ...
 - `live_allowed` zawsze `false`.
 - Nie wkładać private key do runtime dla tego modułu.
 - Hermes może odpalać backtest po ops locku, ale nie edytuje kodu.
+
+## GTFA score calibration v1
+
+Wallet API remains optional/disabled until Helius enables the beta endpoint. The default source for mother-wallet scoring is GTFA.
+
+Calibrated `risk_score` now considers:
+
+```text
+shared mother ratio
+repeated buyer count from same mother
+FAST_DUMPER / DEV_SNIPER_SUSPECT buyer labels
+same-slot / same-time clustering
+similar buy size clustering
+repeated bad/good mother outcomes from current sample
+state.jsonl outcomes: hard_stop, dust_or_rug, price_unavailable, realized PnL
+```
+
+Calibrated `follow_score` rewards:
+
+```text
+GOOD_SNIPER / GOOD_FLIP_SNIPER labels
+independent early buyers
+repeated good mother outcomes
+positive realized/forward outcome when available
+```
+
+Calibration report:
+
+```bash
+python3 scripts/bundler_score_calibration_report.py
+```
+
+Outputs:
+
+```text
+datasets/bundler_score_calibration_report.md
+datasets/bundler_score_calibration_summary.json
+```

@@ -19,10 +19,10 @@ datasets/fresh_shadow_gate_report.md
 Decisions:
 
 ```text
-FOLLOW_SHADOW_STRONG      sniper signal + non-toxic bundler/funding structure
-FOLLOW_SHADOW_CANDIDATE   sniper signal present, but bundle confidence is weaker
-AVOID_DEV_CLUSTER         toxic shared mother / dev sniper suspect / high risk
-UNKNOWN_WAIT              insufficient combined signal
+FOLLOW_SHADOW_STRONG      sniper signal + follow_score >= 65 + risk_score < 45
+FOLLOW_SHADOW_CANDIDATE   sniper signal + follow_score >= 45 + risk_score < 60
+AVOID_DEV_CLUSTER         risk_score >= 70, DEV_SNIPER_SUSPECT, or repeated bad mother
+UNKNOWN_WAIT              insufficient combined signal or needs more outcome validation
 ```
 
 Safety:
@@ -32,18 +32,22 @@ live_allowed=false for every row
 no runtime changes
 no wallet/private key access
 no canary permission
+Wallet API optional/disabled until Helius enables beta access
+GTFA graph is the default source for funding/mother-wallet scoring
 ```
 
 Run:
 
 ```bash
 python3 scripts/fresh_shadow_gate_report.py
+python3 scripts/bundler_score_calibration_report.py
 ```
 
 Acceptance before any live use:
 
 ```text
-risk_score not zero-heavy
+risk_score not zero-heavy for early clusters
 AVOID_DEV_CLUSTER catches known hard_stop/rug/dust rows
-FOLLOW_SHADOW_STRONG has better 30s/60s forward outcomes than baseline
+FOLLOW_SHADOW_STRONG remains small/selective
+FOLLOW_SHADOW_CANDIDATE excludes high-risk shared mother clusters
 ```

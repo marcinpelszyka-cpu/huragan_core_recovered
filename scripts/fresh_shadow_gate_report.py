@@ -45,6 +45,16 @@ def load_by_mint(path):
     return out
 
 
+def repeated_bad_mother(bundler):
+    for m in bundler.get("top_mother_wallets") or []:
+        try:
+            if int(m.get("bad_count") or 0) >= 2 and int(m.get("bad_count") or 0) >= int(m.get("good_count") or 0):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def decision_for(sniper, bundler):
     sniper_passed = bool(sniper.get("passed") or sniper.get("signal") == "FOLLOW_SHADOW" or sniper.get("signal") is True)
     good_snipers = int(sniper.get("good_sniper_count") or sniper.get("good_flip_sniper_count") or 0)
@@ -54,22 +64,19 @@ def decision_for(sniper, bundler):
     risk = float(bundler.get("risk_score") or 0.0)
     follow = float(bundler.get("follow_score") or 0.0)
     shared = int(bundler.get("shared_mother_count") or 0)
-    early = int(bundler.get("early_buyer_count") or 0)
 
-    toxic_cluster = cls == "DEV_SNIPER_SUSPECT" or risk >= 70 or (shared >= 3 and cls in {"SHARED_MOTHER_CLUSTER", "BUNDLE_LIKELY"})
+    toxic_cluster = cls == "DEV_SNIPER_SUSPECT" or risk >= 70 or repeated_bad_mother(bundler)
     strong_sniper = sniper_passed and good_snipers >= 2 and good_buy_sol >= 0.03
-    constructive_bundle = cls in {"GOOD_SNIPER_CLUSTER", "INDEPENDENT_BUYERS", "BUNDLE_POSSIBLE"} and risk < 60
 
     if toxic_cluster:
-        return "AVOID_DEV_CLUSTER", "toxic_shared_mother_or_high_risk"
-    if strong_sniper and constructive_bundle and follow >= 50:
-        return "FOLLOW_SHADOW_STRONG", "sniper_signal_plus_non_toxic_bundle"
-    if strong_sniper and risk < 50 and cls != "DEV_SNIPER_SUSPECT":
-        return "FOLLOW_SHADOW_CANDIDATE", "sniper_signal_but_bundle_not_strong_enough"
-    if early >= 2 and shared >= 2 and risk < 60:
-        return "UNKNOWN_WAIT", "shared_mother_cluster_needs_outcome_validation"
+        return "AVOID_DEV_CLUSTER", "high_risk_or_repeated_bad_mother"
+    if strong_sniper and follow >= 65 and risk < 45:
+        return "FOLLOW_SHADOW_STRONG", "sniper_signal_plus_calibrated_low_risk_follow"
+    if strong_sniper and follow >= 45 and risk < 60:
+        return "FOLLOW_SHADOW_CANDIDATE", "sniper_signal_plus_moderate_follow_score"
+    if shared >= 2 and risk < 60:
+        return "UNKNOWN_WAIT", "shared_mother_cluster_needs_more_outcome_validation"
     return "UNKNOWN_WAIT", "insufficient_combined_signal"
-
 
 def merge(sniper_by_mint, bundler_by_mint):
     rows = []

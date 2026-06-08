@@ -432,11 +432,25 @@ def load_outcomes(path="state.jsonl"):
     for mint, r in latest.items():
         reason = r.get("exit_reason") or r.get("live_exit_reason") or ""
         status = r.get("status") or ""
-        bad = status == "unrecoverable_dust_or_rug" or reason in {"hard_stop", "rug_guard", "price_unavailable"} or "dust_or_rug" in reason
-        good = r.get("realized_pnl_sol", 0) and fnum(r.get("realized_pnl_sol")) > 0
-        out[mint] = {"status": status, "exit_reason": reason, "bad_outcome": bool(bad), "good_outcome": bool(good)}
+        pnl = fnum(r.get("realized_pnl_sol") or r.get("net_pnl_sol"), 0.0)
+        bad_reason = (
+            status == "unrecoverable_dust_or_rug"
+            or reason in {"hard_stop", "rug_guard", "price_unavailable"}
+            or "dust_or_rug" in reason
+            or "rug" in reason
+        )
+        bad = bad_reason or pnl < -0.0005
+        good = pnl > 0.00005
+        out[mint] = {
+            "status": status,
+            "exit_reason": reason,
+            "realized_pnl_sol": pnl,
+            "bad_outcome": bool(bad),
+            "good_outcome": bool(good),
+            "hard_stop_like": reason == "hard_stop" or "dust_or_rug" in reason or status == "unrecoverable_dust_or_rug",
+            "price_unavailable_like": reason == "price_unavailable",
+        }
     return out
-
 
 def find_funding_source_from_rows(rows, buyer, buy_time, min_sol=0.001):
     best = None
@@ -540,10 +554,27 @@ def funding_source_for_buyer(rpc, wallet_api, buyer, buy_time, args):
     return funding
 
 
-def classify_cluster(early_buyers, edges, wallet_classes, outcome):
+def mother_reputation(edges, outcomes):
+    """Return per-mother repeated good/bad outcome counts from current sample."""
+    by_mother_mint = defaultdict(set)
+    for e in edges:
+        m = e.get("mother_wallet") or ""
+        mint = e.get("mint") or ""
+        if m and mint:
+            by_mother_mint[m].add(mint)
+    rep = {}
+    for mother, mints in by_mother_mint.items():
+        bad = sum(1 for mint in mints if outcomes.get(mint, {}).get("bad_outcome"))
+        good = sum(1 for mint in mints if outcomes.get(mint, {}).get("good_outcome"))
+        rep[mother] = {"mint_count": len(mints), "bad_count": bad, "good_count": good}
+    return rep
+
+
+def classify_cluster(early_buyers, edges, wallet_classes, outcome, mother_rep=None):
+    mother_rep = mother_rep or {}
     buyer_count = len({b["owner"] for b in early_buyers})
     if buyer_count == 0:
-        return "UNKNOWN", 0.0, 0.0, 0.0, []
+        return "UNKNOWN", 0.0, 0.0, 0.0, [], 0.0
 
     slots = [b.get("slot", 0) for b in early_buyers if b.get("slot")]
     times = [b.get("timestamp", 0) for b in early_buyers if b.get("timestamp")]
@@ -552,10 +583,21 @@ def classify_cluster(early_buyers, edges, wallet_classes, outcome):
     time_span = max(times) - min(times) if len(times) >= 2 else 999999
     avg_buy = sum(buys) / len(buys) if buys else 0.0
     similar_buys = sum(1 for x in buys if avg_buy and abs(x - avg_buy) / avg_buy <= 0.35)
+    similar_buy_ratio = similar_buys / max(1, len(buys))
 
     mother_counts = Counter(e.get("mother_wallet") for e in edges if e.get("mother_wallet"))
-    top_mothers = [{"mother_wallet": m, "buyer_count": c} for m, c in mother_counts.most_common(5)]
+    top_mothers = []
+    for m, c in mother_counts.most_common(5):
+        rep = mother_rep.get(m, {})
+        top_mothers.append({
+            "mother_wallet": m,
+            "buyer_count": c,
+            "mint_count": rep.get("mint_count", 0),
+            "bad_count": rep.get("bad_count", 0),
+            "good_count": rep.get("good_count", 0),
+        })
     shared_mother_count = top_mothers[0]["buyer_count"] if top_mothers else 0
+    shared_mother_ratio = shared_mother_count / max(1, buyer_count)
 
     bundle_score = 0.0
     if buyer_count >= 2:
@@ -566,49 +608,95 @@ def classify_cluster(early_buyers, edges, wallet_classes, outcome):
         bundle_score += 25
     elif time_span <= 5:
         bundle_score += 15
-    if buys and similar_buys >= max(2, math.ceil(len(buys) * 0.6)):
+    if buys and similar_buy_ratio >= 0.6:
         bundle_score += 15
     if shared_mother_count >= 2:
         bundle_score += 25
     bundle_score = min(100.0, bundle_score)
 
-    mother_score = min(100.0, shared_mother_count / max(1, buyer_count) * 100.0)
+    mother_score = min(100.0, shared_mother_ratio * 100.0)
     good_buyers = sum(1 for b in early_buyers if wallet_classes.get(b["owner"]) in {"GOOD_SNIPER", "GOOD_FLIP_SNIPER"})
     fast_dumpers = sum(1 for b in early_buyers if wallet_classes.get(b["owner"]) in {"FAST_DUMPER", "DEV_SNIPER_SUSPECT"})
     bad_outcome = bool(outcome.get("bad_outcome"))
     good_outcome = bool(outcome.get("good_outcome"))
+    repeated_bad_mother = any(m.get("bad_count", 0) >= 2 and m.get("bad_count", 0) >= m.get("good_count", 0) for m in top_mothers)
+    repeated_good_mother = any(m.get("good_count", 0) >= 2 and m.get("good_count", 0) > m.get("bad_count", 0) for m in top_mothers)
 
     risk_score = 0.0
-    risk_score += mother_score * 0.45
-    risk_score += min(35.0, fast_dumpers * 15.0)
+    risk_score += mother_score * 0.35
+    risk_score += min(25.0, max(0, shared_mother_count - 1) * 12.5)
+    risk_score += min(25.0, fast_dumpers * 12.5)
+    if slot_span <= 1 or time_span <= 2:
+        risk_score += 10.0
+    if similar_buy_ratio >= 0.75 and buyer_count >= 3:
+        risk_score += 10.0
+    if repeated_bad_mother:
+        risk_score += 20.0
     if bad_outcome:
         risk_score += 20.0
-    risk_score = min(100.0, risk_score)
+    if repeated_good_mother and not bad_outcome:
+        risk_score -= 10.0
+    risk_score = max(0.0, min(100.0, risk_score))
 
     follow_score = 0.0
-    follow_score += min(50.0, good_buyers * 20.0)
-    follow_score += max(0.0, 30.0 - mother_score * 0.3)
+    follow_score += min(45.0, good_buyers * 18.0)
+    if buyer_count >= 2 and shared_mother_ratio < 0.5:
+        follow_score += 20.0
+    if buyer_count >= 3 and shared_mother_ratio < 0.67:
+        follow_score += 10.0
+    if repeated_good_mother:
+        follow_score += 15.0
     if good_outcome:
         follow_score += 20.0
-    if risk_score >= 60:
-        follow_score *= 0.4
-    follow_score = min(100.0, follow_score)
+    if risk_score >= 70:
+        follow_score *= 0.35
+    elif risk_score >= 55:
+        follow_score *= 0.6
+    elif risk_score >= 40:
+        follow_score *= 0.8
+    follow_score = max(0.0, min(100.0, follow_score))
 
-    if shared_mother_count >= 3:
-        cls = "DEV_SNIPER_SUSPECT" if risk_score >= 60 or bad_outcome else "SHARED_MOTHER_CLUSTER"
+    if shared_mother_count >= 3 and (risk_score >= 60 or bad_outcome or repeated_bad_mother):
+        cls = "DEV_SNIPER_SUSPECT"
+    elif shared_mother_count >= 3:
+        cls = "SHARED_MOTHER_CLUSTER"
     elif shared_mother_count >= 2:
         cls = "SHARED_MOTHER_CLUSTER"
+    elif good_buyers >= 2 and risk_score < 50:
+        cls = "GOOD_SNIPER_CLUSTER"
     elif bundle_score >= 65:
         cls = "BUNDLE_LIKELY"
     elif bundle_score >= 40:
         cls = "BUNDLE_POSSIBLE"
-    elif good_buyers >= 2 and risk_score < 50:
-        cls = "GOOD_SNIPER_CLUSTER"
     elif buyer_count >= 2:
         cls = "INDEPENDENT_BUYERS"
     else:
         cls = "UNKNOWN"
     return cls, round(bundle_score, 4), round(mother_score, 4), round(risk_score, 4), top_mothers, round(follow_score, 4)
+
+def build_signal_for_mint(mint, early_unique, edges, wallet_classes, outcome, mother_rep=None):
+    cls, bundle_score, mother_score, risk_score, top_mothers, follow_score = classify_cluster(
+        early_unique, edges, wallet_classes, outcome, mother_rep=mother_rep
+    )
+    return {
+        "mint": mint,
+        "early_buyer_count": len(early_unique),
+        "shared_mother_count": top_mothers[0]["buyer_count"] if top_mothers else 0,
+        "top_mother_wallets": top_mothers,
+        "bundle_classification": cls,
+        "bundle_score": bundle_score,
+        "mother_score": mother_score,
+        "risk_score": risk_score,
+        "follow_score": follow_score,
+        "bad_outcome": bool(outcome.get("bad_outcome")),
+        "good_outcome": bool(outcome.get("good_outcome")),
+        "hard_stop_like": bool(outcome.get("hard_stop_like")),
+        "price_unavailable_like": bool(outcome.get("price_unavailable_like")),
+        "realized_pnl_sol": fnum(outcome.get("realized_pnl_sol"), 0.0),
+        "exit_reason": outcome.get("exit_reason", ""),
+        "status": outcome.get("status", ""),
+        "live_allowed": False,
+    }
 
 
 def write_clusters_csv(path, clusters):
@@ -671,24 +759,8 @@ def build_for_mint(rpc, wallet_api, candidate, args, wallet_classes, outcomes):
         edges.append(edge)
 
     outcome = outcomes.get(mint, {})
-    cls, bundle_score, mother_score, risk_score, top_mothers, follow_score = classify_cluster(early_unique, edges, wallet_classes, outcome)
-    signal = {
-        "mint": mint,
-        "early_buyer_count": len(early_unique),
-        "shared_mother_count": top_mothers[0]["buyer_count"] if top_mothers else 0,
-        "top_mother_wallets": top_mothers,
-        "bundle_classification": cls,
-        "bundle_score": bundle_score,
-        "mother_score": mother_score,
-        "risk_score": risk_score,
-        "follow_score": follow_score,
-        "bad_outcome": bool(outcome.get("bad_outcome")),
-        "good_outcome": bool(outcome.get("good_outcome")),
-        "exit_reason": outcome.get("exit_reason", ""),
-        "status": outcome.get("status", ""),
-        "live_allowed": False,
-    }
-    return events, edges, signal
+    signal = build_signal_for_mint(mint, early_unique, edges, wallet_classes, outcome)
+    return events, edges, signal, early_unique
 
 
 def selected_rpc_url(args):
@@ -714,6 +786,7 @@ def run(args):
     wallet_classes = load_wallet_classes(args.wallet_scores)
     outcomes = load_outcomes(args.state)
     all_edges = []
+    signal_contexts = []
     signals = []
     processed = 0
     early_clusters = 0
@@ -721,8 +794,9 @@ def run(args):
         if args.limit_mints and processed >= args.limit_mints:
             break
         try:
-            _events, edges, signal = build_for_mint(rpc, wallet_api, c, args, wallet_classes, outcomes)
+            _events, edges, signal, early_unique = build_for_mint(rpc, wallet_api, c, args, wallet_classes, outcomes)
             all_edges.extend(edges)
+            signal_contexts.append((c.get("mint", ""), early_unique, edges))
             signals.append(signal)
             processed += 1
             if signal["early_buyer_count"] >= 2:
@@ -731,6 +805,11 @@ def run(args):
             if not args.dry_run:
                 append_jsonl(args.errors, {"mode": "bundler_funding", "mint": c.get("mint", ""), "reason": str(e)})
 
+    mother_rep = mother_reputation(all_edges, outcomes)
+    signals = [
+        build_signal_for_mint(mint, early_unique, edges, wallet_classes, outcomes.get(mint, {}), mother_rep=mother_rep)
+        for mint, early_unique, edges in signal_contexts
+    ]
     clusters = signals
     if not args.dry_run:
         write_jsonl(args.out_edges, all_edges)
