@@ -179,12 +179,27 @@ class WalletApi:
         self.calls += 1
         if self.sleep_s:
             time.sleep(self.sleep_s)
-        url = f"https://api.helius.xyz/v1/wallet/{urllib.parse.quote(wallet)}/funded-by"
-        req = urllib.request.Request(url, headers={"X-Api-Key": self.api_key, "Accept": "application/json"})
+        base_url = f"https://api.helius.xyz/v1/wallet/{urllib.parse.quote(wallet)}/funded-by"
+        req = urllib.request.Request(base_url, headers={"X-Api-Key": self.api_key, "Accept": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return json.load(resp)
         except urllib.error.HTTPError as e:
+            # Docs support both header and api-key query authentication. Some
+            # beta endpoints/accounts can reject one auth mode, so retry once
+            # with query auth without ever printing the key.
+            if e.code in {401, 403}:
+                try:
+                    q = urllib.parse.urlencode({"api-key": self.api_key})
+                    req2 = urllib.request.Request(f"{base_url}?{q}", headers={"Accept": "application/json"})
+                    with urllib.request.urlopen(req2, timeout=30) as resp:
+                        return json.load(resp)
+                except urllib.error.HTTPError as e2:
+                    self.errors[f"http_{e2.code}"] += 1
+                    return None
+                except Exception:
+                    self.errors["transport"] += 1
+                    return None
             self.errors[f"http_{e.code}"] += 1
             return None
         except Exception:
