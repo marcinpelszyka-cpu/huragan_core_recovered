@@ -77,7 +77,7 @@ Environment=LIVE_SEND_BACKEND=rpc
 Environment=LIVE_SEND_PREFLIGHT_COMMITMENT=processed
 EOF
 systemctl daemon-reload
-systemctl reset-failed migration-sniper.service
+systemctl reset-failed migration-sniper.service || true
 systemctl restart migration-sniper.service
 sleep 3
 /opt/huragan_core/scripts/huragan_runtime_verify.sh

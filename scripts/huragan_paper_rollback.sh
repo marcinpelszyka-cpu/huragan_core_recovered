@@ -48,7 +48,7 @@ Environment=ALLOW_PLAINTEXT_PRIVATE_KEY=false
 Environment=AMM_LIVE_CANARY=false
 EOF
 systemctl daemon-reload
-systemctl reset-failed migration-sniper.service
+systemctl reset-failed migration-sniper.service || true
 systemctl restart migration-sniper.service
 sleep 3
 /opt/huragan_core/scripts/huragan_runtime_verify.sh
