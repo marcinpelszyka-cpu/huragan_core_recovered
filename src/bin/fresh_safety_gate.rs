@@ -790,6 +790,36 @@ Shadow-only diagnostics. No live permission.
     Ok(())
 }
 
+fn strv_opt(v: Option<&Value>) -> Option<&str> {
+    v.and_then(|v| v.as_str())
+}
+
+fn u64v(v: Option<&Value>) -> Option<u64> {
+    v.and_then(|v| v.as_u64())
+}
+
+fn token_age_secs(related: &[&Value; 4], now_secs: u64) -> u64 {
+    // Try multiple timestamp fields across all datasets
+    for key in &["signal_time", "block_time", "created_at", "captured_at_utc"] {
+        for r in related {
+            if let Some(ts) = u64v(r.get(key)) {
+                if ts > 0 && ts < now_secs {
+                    return now_secs.saturating_sub(ts);
+                }
+            }
+            // Also try string timestamps (ISO 8601 or Unix as string)
+            if let Some(s) = strv_opt(r.get(key)) {
+                if let Ok(ts) = s.parse::<u64>() {
+                    if ts > 0 && ts < now_secs {
+                        return now_secs.saturating_sub(ts);
+                    }
+                }
+            }
+        }
+    }
+    0 // unknown age — treat as fresh
+}
+
 async fn run(args: &[String]) -> anyhow::Result<Value> {
     let shadow_path = arg_value(args, "--shadow-gate", DEFAULT_SHADOW_GATE);
     let bundler_path = arg_value(args, "--bundler", DEFAULT_BUNDLER);
@@ -803,6 +833,7 @@ async fn run(args: &[String]) -> anyhow::Result<Value> {
     let diagnostics_json_path = arg_value(args, "--diagnostics-json", DEFAULT_DIAGNOSTICS_JSON);
     let diagnostics_md_path = arg_value(args, "--diagnostics-md", DEFAULT_DIAGNOSTICS_MD);
     let limit_mints: usize = arg_value(args, "--limit-mints", "0").parse().unwrap_or(0);
+    let max_age_min: u64 = arg_value(args, "--max-age-min", "0").parse().unwrap_or(0);
     let dry_run = has_flag(args, "--dry-run");
     let no_rpc = has_flag(args, "--no-rpc") || dry_run;
     let rpc_url = if no_rpc {
@@ -835,6 +866,13 @@ async fn run(args: &[String]) -> anyhow::Result<Value> {
     let mut safety_rows = Vec::new();
     let mut insider_rows = Vec::new();
     let mut gate_rows = Vec::new();
+    let mut stale_skipped = 0u64;
+    let mut rpc_null_mint = 0u64;
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
 
     for mint in &mints {
         let gate = shadow.get(mint).unwrap_or(&Value::Null);
@@ -842,6 +880,22 @@ async fn run(args: &[String]) -> anyhow::Result<Value> {
         let s = sniper.get(mint).unwrap_or(&Value::Null);
         let f = forward.get(mint).unwrap_or(&Value::Null);
         let related = [gate, b, s, f];
+
+        // Freshness filter: compute age from available timestamp fields
+        if max_age_min > 0 {
+            let age_secs = token_age_secs(&related, now_secs);
+            if age_secs > max_age_min * 60 {
+                stale_skipped += 1;
+                gate_rows.push(json!( {
+                    "mint": mint,
+                    "decision": "STALE_SKIPPED",
+                    "reason": format!("age_secs={age_secs}:max_age_min={max_age_min}"),
+                    "token_age_minutes": age_secs / 60,
+                    "live_allowed": false,
+                }));
+                continue;
+            }
+        }
         let excluded = pool_exclusion_accounts(&related);
         let mint_info = if rpc_enabled {
             fetch_mint_info(&client, &rpc_url, mint).await
@@ -866,7 +920,10 @@ async fn run(args: &[String]) -> anyhow::Result<Value> {
         gate_rows.push(gate_row);
     }
 
-    let summary = make_summary(&gate_rows, &safety_rows, &insider_rows, rpc_enabled);
+    let mut summary = make_summary(&gate_rows, &safety_rows, &insider_rows, rpc_enabled);
+    if let Some(obj) = summary.as_object_mut() {
+        obj.insert("stale_skipped".to_string(), json!(stale_skipped));
+    }
     if !dry_run {
         write_jsonl(&out_safety, &safety_rows)?;
         write_jsonl(&out_insider, &insider_rows)?;
