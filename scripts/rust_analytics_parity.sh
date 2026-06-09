@@ -11,7 +11,15 @@ RS_DIR="$TMP_DIR/rs"
 rm -rf "$TMP_DIR"
 mkdir -p "$PY_DIR" "$RS_DIR"
 
-cargo build --release --bin fresh_forward_labeler --bin fresh_shadow_gate --bin bundler_score_report >/dev/null
+CARGO_BIN="${CARGO_BIN:-$(command -v cargo || true)}"
+if [[ -z "$CARGO_BIN" && -x /root/.cargo/bin/cargo ]]; then
+  CARGO_BIN="/root/.cargo/bin/cargo"
+fi
+if [[ -z "$CARGO_BIN" ]]; then
+  echo "cargo not found; set CARGO_BIN=/path/to/cargo" >&2
+  exit 127
+fi
+"$CARGO_BIN" build --release --bin fresh_forward_labeler --bin fresh_shadow_gate --bin bundler_score_report >/dev/null
 
 python3 scripts/fresh_forward_outcome_labeler.py \
   --out "$PY_DIR/fresh_forward_outcomes.jsonl" \
