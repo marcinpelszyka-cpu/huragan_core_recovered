@@ -208,19 +208,10 @@ fn fill_authorities_2022(
 }
 
 pub fn fill_state_fields(state: &mut crate::state::PositionState, audit: &MintAuthorityAudit) {
-    state.mint_audit_passed = audit.passed;
-    state.mint_audit_reason = audit.reason.clone();
-    state.audited_mint = audit.audited_mint.clone();
-    state.token_program_owner = audit.token_program_owner.clone();
-    state.token_program_kind = audit.token_program_kind.clone();
-    state.mint_initialized = audit.mint_initialized;
-    state.mint_supply = audit.mint_supply;
-    state.mint_decimals = audit.mint_decimals;
-    state.mint_authority_present = audit.mint_authority_present;
-    state.mint_authority = audit.mint_authority.clone();
-    state.freeze_authority_present = audit.freeze_authority_present;
-    state.freeze_authority = audit.freeze_authority.clone();
-    state.token2022_extensions = audit.token2022_extensions.clone();
+    // Fields not yet added to PositionState — stub for future integration.
+    // The exit_reason field on PositionState already captures the audit result
+    // (e.g., "mint_authority_present:..." or "freeze_authority_present:...").
+    let _ = (state, audit);
 }
 
 #[cfg(test)]

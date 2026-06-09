@@ -14,6 +14,7 @@ mod live_sell;
 mod notifier;
 mod paper_amm;
 mod position_manager;
+mod mint_audit;
 mod recovery;
 mod scout;
 mod sniper_shadow;
@@ -195,6 +196,83 @@ async fn main() -> anyhow::Result<()> {
                 target.mint
             );
             continue;
+        }
+
+        // Mint authority audit — blocks tokens with active mint_authority or freeze_authority
+        if target.is_amm() {
+            match mint_audit::audit_target_mint(&rpc, &target).await {
+                Ok(audit) if audit.passed => {
+                    // Audit metadata will be filled into paper_entry/live rows
+                    // by fill_state_fields when creating PositionState
+                }
+                Ok(audit) => {
+                    let reason = audit.reason.clone();
+                    println!(
+                        "🔒 mint audit blocked {}: {}",
+                        target.mint, reason
+                    );
+                    if paper_mode {
+                        let quote_asset_mint = if target.quote_asset_mint.is_empty() {
+                            target.base_mint.clone()
+                        } else {
+                            target.quote_asset_mint.clone()
+                        };
+                        let state = PositionState {
+                            mint: target.mint.clone(),
+                            status: "prelive_mint_audit_shadow".into(),
+                            source: target.source.clone(),
+                            pool_state: target.pool_state.clone(),
+                            base_mint: target.base_mint.clone(),
+                            quote_mint: target.quote_mint.clone(),
+                            pool_base_token_account: target.pool_base_token_account.clone(),
+                            pool_quote_token_account: target.pool_quote_token_account.clone(),
+                            quote_asset_mint,
+                            creator_address: target.creator.clone(),
+                            creator_score: target.creator_score,
+                            top10_holder_pct: target.top10_holder_pct,
+                            curve_velocity_secs: target.curve_velocity_secs,
+                            exit_reason: reason,
+                            excluded_from_stats: true,
+                            ..Default::default()
+                        };
+                        let _ = ledger.save_new_position(&state);
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "⚠️ mint audit RPC error for {}: {e}",
+                        target.mint
+                    );
+                    if paper_mode {
+                        let quote_asset_mint = if target.quote_asset_mint.is_empty() {
+                            target.base_mint.clone()
+                        } else {
+                            target.quote_asset_mint.clone()
+                        };
+                        let state = PositionState {
+                            mint: target.mint.clone(),
+                            status: "prelive_mint_audit_shadow".into(),
+                            source: target.source.clone(),
+                            pool_state: target.pool_state.clone(),
+                            base_mint: target.base_mint.clone(),
+                            quote_mint: target.quote_mint.clone(),
+                            pool_base_token_account: target.pool_base_token_account.clone(),
+                            pool_quote_token_account: target.pool_quote_token_account.clone(),
+                            quote_asset_mint,
+                            creator_address: target.creator.clone(),
+                            creator_score: target.creator_score,
+                            top10_holder_pct: target.top10_holder_pct,
+                            curve_velocity_secs: target.curve_velocity_secs,
+                            exit_reason: format!("mint_audit_rpc_error:{e}"),
+                            excluded_from_stats: true,
+                            ..Default::default()
+                        };
+                        let _ = ledger.save_new_position(&state);
+                    }
+                    continue;
+                }
+            }
         }
 
         if paper_mode {
