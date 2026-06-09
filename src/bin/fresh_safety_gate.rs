@@ -3,7 +3,7 @@ mod analytics;
 use analytics::*;
 use base64::Engine;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 const DEFAULT_SHADOW_GATE: &str = "datasets/fresh_shadow_gate_signals.jsonl";
@@ -15,6 +15,8 @@ const DEFAULT_OUT_INSIDER: &str = "datasets/fresh_insider_risk_signals.jsonl";
 const DEFAULT_OUT_GATE: &str = "datasets/fresh_selection_gate_v1.jsonl";
 const DEFAULT_SUMMARY: &str = "datasets/fresh_selection_gate_v1_summary.json";
 const DEFAULT_REPORT: &str = "datasets/fresh_selection_gate_v1_report.md";
+const DEFAULT_DIAGNOSTICS_JSON: &str = "datasets/fresh_selection_gate_v1_diagnostics.json";
+const DEFAULT_DIAGNOSTICS_MD: &str = "datasets/fresh_selection_gate_v1_diagnostics.md";
 
 #[derive(Debug, Clone, Default)]
 struct RpcMintInfo {
@@ -329,6 +331,55 @@ fn v2_follow_signal(gate: &Value) -> bool {
     )
 }
 
+fn score_bucket(v: f64) -> &'static str {
+    if v < 20.0 {
+        "00-20"
+    } else if v < 45.0 {
+        "20-45"
+    } else if v < 60.0 {
+        "45-60"
+    } else if v < 65.0 {
+        "60-65"
+    } else if v < 80.0 {
+        "65-80"
+    } else {
+        "80-100"
+    }
+}
+
+fn forward_win(forward: &Value) -> bool {
+    matches!(
+        strv(forward, "outcome_label"),
+        "forward_win_30s" | "forward_win_60s"
+    )
+}
+
+fn holder_metrics_present(holders: &HolderStats) -> bool {
+    holders.top_5_ex_pool_pct.is_some() && holders.top_10_ex_pool_pct.is_some()
+}
+
+fn authority_verified(mint_info: &RpcMintInfo) -> bool {
+    mint_info.mint_authority_active == Some(false)
+        && mint_info.freeze_authority_active == Some(false)
+}
+
+fn holder_ok_at(holders: &HolderStats, top5_max: f64, top10_max: f64) -> bool {
+    holders
+        .top_5_ex_pool_pct
+        .map(|v| v <= top5_max)
+        .unwrap_or(false)
+        && holders
+            .top_10_ex_pool_pct
+            .map(|v| v <= top10_max)
+            .unwrap_or(false)
+}
+
+fn safety_verified(mint_info: &RpcMintInfo, holders: &HolderStats) -> bool {
+    authority_verified(mint_info)
+        && holder_metrics_present(holders)
+        && holder_ok_at(holders, 30.0, 45.0)
+}
+
 fn decide(
     gate: &Value,
     bundler: &Value,
@@ -378,6 +429,7 @@ fn decide(
     }
     let shared = i64v(bundler.get("shared_mother_count"), 0);
     let risk = f64v(bundler.get("risk_score"), 0.0);
+    let follow = f64v(bundler.get("follow_score"), 0.0);
     if shared >= 3 && risk >= 60.0 {
         return (
             "AVOID_INSIDER_CLUSTER".into(),
@@ -394,45 +446,55 @@ fn decide(
             ),
         );
     }
-    let authority_ok = mint_info.mint_authority_active != Some(true)
-        && mint_info.freeze_authority_active == Some(false);
-    let holder_ok = holders.top_5_ex_pool_pct.map(|v| v <= 30.0).unwrap_or(true)
-        && holders
-            .top_10_ex_pool_pct
-            .map(|v| v <= 45.0)
-            .unwrap_or(true);
-    if v2_follow_signal(gate) && authority_ok && holder_ok && risk < 45.0 {
+
+    if !authority_verified(mint_info) || !holder_metrics_present(holders) {
+        return (
+            "UNKNOWN_WAIT".into(),
+            format!(
+                "unverified_safety:authority={}:{}/holder_metrics_present={}",
+                authority_state(mint_info.mint_authority_active),
+                authority_state(mint_info.freeze_authority_active),
+                holder_metrics_present(holders)
+            ),
+        );
+    }
+
+    if !holder_ok_at(holders, 30.0, 45.0) {
+        return (
+            "UNKNOWN_WAIT".into(),
+            "holder_metrics_borderline_without_hard_reject".into(),
+        );
+    }
+
+    if v2_follow_signal(gate) && risk < 45.0 {
         return (
             "FOLLOW_CANDIDATE".into(),
-            "v2_follow_signal_plus_safety_pass".into(),
+            "v2_follow_signal_plus_verified_safety".into(),
         );
     }
-    if mint_info.mint_authority_active == Some(false)
-        && mint_info.freeze_authority_active == Some(false)
-        && holder_ok
-        && risk < 60.0
-    {
+    if follow >= 65.0 && risk < 45.0 && shared <= 1 && holder_ok_at(holders, 20.0, 35.0) {
         return (
-            "SAFE_TO_WATCH".into(),
-            "safety_pass_without_v2_follow".into(),
+            "WATCHLIST_CANDIDATE_STRONG".into(),
+            format!(
+                "strong_watchlist:follow={follow:.1}:risk={risk:.1}:shared_mother_count={shared}"
+            ),
         );
     }
-    // Safety pass but authority unverified or risk borderline — shadow observation only
-    if holder_ok
-        && !matches!(mint_info.mint_authority_active, Some(true))
-        && mint_info.freeze_authority_active != Some(true)
-        && risk < 70.0
-    {
+    if follow >= 45.0 && risk < 60.0 && shared <= 2 && holder_ok_at(holders, 25.0, 40.0) {
         return (
             "WATCHLIST_CANDIDATE".into(),
-            format!("safety_pass_shadow_only:risk={risk:.1}:authority_unverified_or_borderline"),
+            format!("watchlist:follow={follow:.1}:risk={risk:.1}:shared_mother_count={shared}"),
+        );
+    }
+    if safety_verified(mint_info, holders) {
+        return (
+            "SAFE_TO_WATCH".into(),
+            "verified_safety_pass_without_follow_edge".into(),
         );
     }
     (
         "UNKNOWN_WAIT".into(),
-        format!("insufficient_data:authority={}:{}/holder_ok={holder_ok}/risk={risk:.1}", 
-            authority_state(mint_info.mint_authority_active),
-            authority_state(mint_info.freeze_authority_active)),
+        "insufficient_safety_or_follow_confirmation".into(),
     )
 }
 
@@ -497,6 +559,14 @@ fn build_rows_for_mint(
         "freeze_authority_state": safety["freeze_authority_state"].clone(),
         "top_5_holders_ex_pool_pct": holders.top_5_ex_pool_pct,
         "top_10_holders_ex_pool_pct": holders.top_10_ex_pool_pct,
+        "authority_verified": authority_verified(mint_info),
+        "holder_metrics_present": holder_metrics_present(holders),
+        "safety_verified": safety_verified(mint_info, holders),
+        "tier": decision,
+        "follow_score_bucket": score_bucket(f64v(bundler.get("follow_score"), 0.0)),
+        "risk_score_bucket": score_bucket(f64v(bundler.get("risk_score"), 0.0)),
+        "forward_win": forward_win(forward),
+        "forward_dump_or_rug": forward_dump(forward),
         "lp_status": "not_applicable_or_unknown",
     });
     (safety, insider, gate_row)
@@ -539,7 +609,15 @@ fn write_report(path: &str, summary: &Value, gate_rows: &[Value]) -> anyhow::Res
     out.push_str("\n## Top candidate/watch rows\n\n| Mint | Decision | Risk | Follow | Shadow | Reason |\n|---|---|---:|---:|---|---|\n");
     for r in gate_rows
         .iter()
-        .filter(|r| matches!(strv(r, "decision"), "FOLLOW_CANDIDATE" | "SAFE_TO_WATCH" | "WATCHLIST_CANDIDATE"))
+        .filter(|r| {
+            matches!(
+                strv(r, "decision"),
+                "FOLLOW_CANDIDATE"
+                    | "SAFE_TO_WATCH"
+                    | "WATCHLIST_CANDIDATE"
+                    | "WATCHLIST_CANDIDATE_STRONG"
+            )
+        })
         .take(80)
     {
         out.push_str(&format!(
@@ -561,6 +639,157 @@ fn write_report(path: &str, summary: &Value, gate_rows: &[Value]) -> anyhow::Res
     Ok(())
 }
 
+fn rate(n: usize, d: usize) -> f64 {
+    if d == 0 {
+        0.0
+    } else {
+        ((n as f64 / d as f64) * 10_000.0).round() / 10_000.0
+    }
+}
+
+fn diagnostics(gate_rows: &[Value]) -> Value {
+    let mut by_decision: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
+    for r in gate_rows {
+        by_decision
+            .entry(strv(r, "decision").to_string())
+            .or_default()
+            .push(r);
+    }
+    let mut decision_stats = serde_json::Map::new();
+    for (decision, rows) in by_decision {
+        let total = rows.len();
+        let wins = rows.iter().filter(|r| boolv(r.get("forward_win"))).count();
+        let dumps = rows
+            .iter()
+            .filter(|r| boolv(r.get("forward_dump_or_rug")))
+            .count();
+        decision_stats.insert(decision, json!({
+            "count": total,
+            "forward_win": wins,
+            "forward_dump_or_rug": dumps,
+            "win_rate": rate(wins, total),
+            "dump_or_rug_rate": rate(dumps, total),
+            "follow_score_buckets": counter_json(rows.iter().map(|r| strv(r, "follow_score_bucket").to_string())),
+            "risk_score_buckets": counter_json(rows.iter().map(|r| strv(r, "risk_score_bucket").to_string())),
+            "forward_labels": counter_json(rows.iter().map(|r| strv(r, "forward_outcome_label").to_string())),
+        }));
+    }
+    let top_rows = |decision: &str, limit: usize| -> Vec<Value> {
+        let mut rows: Vec<Value> = gate_rows
+            .iter()
+            .filter(|r| strv(r, "decision") == decision)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            let af = f64v(a.get("follow_score"), 0.0);
+            let bf = f64v(b.get("follow_score"), 0.0);
+            let ar = f64v(a.get("risk_score"), 0.0);
+            let br = f64v(b.get("risk_score"), 0.0);
+            bf.partial_cmp(&af)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| ar.partial_cmp(&br).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        rows.into_iter().take(limit).map(|r| json!({
+            "mint": strv(&r, "mint"),
+            "decision": strv(&r, "decision"),
+            "follow_score": f64v(r.get("follow_score"), 0.0),
+            "risk_score": f64v(r.get("risk_score"), 0.0),
+            "shared_mother_count": i64v(r.get("shared_mother_count"), 0),
+            "top_5_holders_ex_pool_pct": r.get("top_5_holders_ex_pool_pct").cloned().unwrap_or(Value::Null),
+            "top_10_holders_ex_pool_pct": r.get("top_10_holders_ex_pool_pct").cloned().unwrap_or(Value::Null),
+            "forward_outcome_label": strv(&r, "forward_outcome_label"),
+            "reason": strv(&r, "reason"),
+        })).collect()
+    };
+    json!({
+        "rows": gate_rows.len(),
+        "decision_stats": decision_stats,
+        "top_watchlist_candidate_strong": top_rows("WATCHLIST_CANDIDATE_STRONG", 25),
+        "top_watchlist_candidate": top_rows("WATCHLIST_CANDIDATE", 25),
+        "top_safe_to_watch": top_rows("SAFE_TO_WATCH", 25),
+        "live_allowed": false,
+    })
+}
+
+fn write_diagnostics_md(path: &str, diag: &Value) -> anyhow::Result<()> {
+    let mut out = String::new();
+    out.push_str(
+        "# Fresh Selection Gate v1 Diagnostics
+
+Shadow-only diagnostics. No live permission.
+
+",
+    );
+    out.push_str(&format!(
+        "- rows: {}
+- live_allowed: false
+
+",
+        diag["rows"]
+    ));
+    out.push_str(
+        "## Decision stats
+
+| Decision | Count | Win rate | Dump/rug rate |
+|---|---:|---:|---:|
+",
+    );
+    if let Some(stats) = diag.get("decision_stats").and_then(|v| v.as_object()) {
+        let mut items: Vec<_> = stats.iter().collect();
+        items.sort_by_key(|(k, _)| *k);
+        for (decision, s) in items {
+            out.push_str(&format!(
+                "| {decision} | {} | {:.2}% | {:.2}% |
+",
+                s["count"],
+                f64v(s.get("win_rate"), 0.0) * 100.0,
+                f64v(s.get("dump_or_rug_rate"), 0.0) * 100.0
+            ));
+        }
+    }
+    for (title, key) in [
+        (
+            "Top WATCHLIST_CANDIDATE_STRONG",
+            "top_watchlist_candidate_strong",
+        ),
+        ("Top WATCHLIST_CANDIDATE", "top_watchlist_candidate"),
+        ("Top SAFE_TO_WATCH", "top_safe_to_watch"),
+    ] {
+        out.push_str(&format!(
+            "
+## {title}
+
+| Mint | Follow | Risk | Shared | Top5 | Top10 | Forward | Reason |
+|---|---:|---:|---:|---:|---:|---|---|
+"
+        ));
+        if let Some(rows) = diag.get(key).and_then(|v| v.as_array()) {
+            for r in rows {
+                let mint = strv(r, "mint");
+                out.push_str(&format!(
+                    "| {}... | {:.1} | {:.1} | {} | {:.2} | {:.2} | {} | {} |
+",
+                    &mint[..mint.len().min(12)],
+                    f64v(r.get("follow_score"), 0.0),
+                    f64v(r.get("risk_score"), 0.0),
+                    i64v(r.get("shared_mother_count"), 0),
+                    f64v(r.get("top_5_holders_ex_pool_pct"), 0.0),
+                    f64v(r.get("top_10_holders_ex_pool_pct"), 0.0),
+                    strv(r, "forward_outcome_label"),
+                    strv(r, "reason"),
+                ));
+            }
+        }
+    }
+    std::fs::create_dir_all(
+        std::path::Path::new(path)
+            .parent()
+            .unwrap_or(std::path::Path::new(".")),
+    )?;
+    std::fs::write(path, out)?;
+    Ok(())
+}
+
 async fn run(args: &[String]) -> anyhow::Result<Value> {
     let shadow_path = arg_value(args, "--shadow-gate", DEFAULT_SHADOW_GATE);
     let bundler_path = arg_value(args, "--bundler", DEFAULT_BUNDLER);
@@ -571,6 +800,8 @@ async fn run(args: &[String]) -> anyhow::Result<Value> {
     let out_gate = arg_value(args, "--out", DEFAULT_OUT_GATE);
     let summary_path = arg_value(args, "--summary", DEFAULT_SUMMARY);
     let report_path = arg_value(args, "--report", DEFAULT_REPORT);
+    let diagnostics_json_path = arg_value(args, "--diagnostics-json", DEFAULT_DIAGNOSTICS_JSON);
+    let diagnostics_md_path = arg_value(args, "--diagnostics-md", DEFAULT_DIAGNOSTICS_MD);
     let limit_mints: usize = arg_value(args, "--limit-mints", "0").parse().unwrap_or(0);
     let dry_run = has_flag(args, "--dry-run");
     let no_rpc = has_flag(args, "--no-rpc") || dry_run;
@@ -642,9 +873,13 @@ async fn run(args: &[String]) -> anyhow::Result<Value> {
         write_jsonl(&out_gate, &gate_rows)?;
         write_json(&summary_path, &summary)?;
         write_report(&report_path, &summary, &gate_rows)?;
+        let diag = diagnostics(&gate_rows);
+        write_json(&diagnostics_json_path, &diag)?;
+        write_diagnostics_md(&diagnostics_md_path, &diag)?;
     }
     Ok(
-        json!({"rows": gate_rows.len(), "decisions": summary["decisions"].clone(), "rpc_enabled": rpc_enabled, "dry_run": dry_run, "out": if dry_run { "DRY_RUN" } else { &out_gate }, "summary": if dry_run { "DRY_RUN" } else { &summary_path }, "live_allowed": false}),
+        json!({"rows": gate_rows.len(), "decisions": summary["decisions"].clone(), "rpc_enabled": rpc_enabled, "dry_run": dry_run, "out": if dry_run { "DRY_RUN" } else { &out_gate }, "summary": if dry_run { "DRY_RUN" } else { &summary_path },
+        "diagnostics": if dry_run { "DRY_RUN" } else { &diagnostics_json_path }, "live_allowed": false}),
     )
 }
 
@@ -718,6 +953,15 @@ fn self_test() {
         &holders,
     );
     assert_eq!(boolv(row.get("live_allowed")), false);
+    assert!(boolv(row.get("authority_verified")));
+    assert!(boolv(row.get("holder_metrics_present")));
+    assert!(boolv(row.get("safety_verified")));
+    let diag = diagnostics(&[row.clone()]);
+    assert_eq!(diag["rows"], 1);
+    assert!(diag["decision_stats"]
+        .as_object()
+        .unwrap()
+        .contains_key("FOLLOW_CANDIDATE"));
     let excl_rows = vec![json!({"pool_base_token_account":"POOL"})];
     let refs: Vec<&Value> = excl_rows.iter().collect();
     assert!(pool_exclusion_accounts(&refs).contains("POOL"));
