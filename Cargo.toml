@@ -15,6 +15,19 @@ path = "src/bin/market_supervisor.rs"
 name = "amm_sell_preflight"
 path = "src/bin/amm_sell_preflight.rs"
 
+
+[[bin]]
+name = "fresh_forward_labeler"
+path = "src/bin/fresh_forward_labeler.rs"
+
+[[bin]]
+name = "fresh_shadow_gate"
+path = "src/bin/fresh_shadow_gate.rs"
+
+[[bin]]
+name = "bundler_score_report"
+path = "src/bin/bundler_score_report.rs"
+
 [dependencies]
 bincode = "1"
 base64 = "0.22"
