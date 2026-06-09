@@ -13,6 +13,7 @@ DEFAULT_SIGNALS = "datasets/fresh_bundle_risk_signals.jsonl"
 DEFAULT_EDGES = "datasets/bundler_wallet_edges.jsonl"
 DEFAULT_SNIPER = "datasets/sniper_follow_signals.jsonl"
 DEFAULT_STATE = "state.jsonl"
+DEFAULT_FORWARD = "datasets/fresh_forward_outcomes.jsonl"
 DEFAULT_REPORT = "datasets/bundler_score_calibration_report.md"
 DEFAULT_SUMMARY = "datasets/bundler_score_calibration_summary.json"
 
@@ -60,7 +61,7 @@ def bucket(v):
     return "80-100"
 
 
-def load_outcomes(path):
+def load_outcomes(path, forward_path=None):
     latest = {}
     for r in read_jsonl(path):
         mint = r.get("mint") or ""
@@ -73,7 +74,19 @@ def load_outcomes(path):
         pnl = fnum(r.get("realized_pnl_sol") or r.get("net_pnl_sol"), 0.0)
         bad = status == "unrecoverable_dust_or_rug" or reason in {"hard_stop", "rug_guard", "price_unavailable"} or "dust_or_rug" in reason or pnl < -0.0005
         good = pnl > 0.00005
-        out[mint] = {"bad": bad, "good": good, "pnl": pnl, "exit_reason": reason, "status": status}
+        out[mint] = {"bad": bad, "good": good, "pnl": pnl, "exit_reason": reason, "status": status, "source": "state"}
+    if forward_path:
+        for r in read_jsonl(forward_path):
+            mint = r.get("mint") or ""
+            if not mint or mint in out:
+                continue
+            label = r.get("outcome_label") or ""
+            pnl = fnum(r.get("pnl_60s_pct"), fnum(r.get("pnl_30s_pct"), 0.0))
+            good = label in {"forward_win_30s", "forward_win_60s"}
+            bad = label in {"hard_dump_30s", "hard_dump_60s", "rug_or_liquidity_collapse"}
+            if label in {"no_trade_data", "insufficient_price_data", "not_evaluated"}:
+                continue
+            out[mint] = {"bad": bad, "good": good, "pnl": pnl, "exit_reason": label, "status": "forward_label", "source": "forward"}
     return out
 
 
@@ -151,13 +164,14 @@ def main():
     ap.add_argument("--edges", default=DEFAULT_EDGES)
     ap.add_argument("--sniper", default=DEFAULT_SNIPER)
     ap.add_argument("--state", default=DEFAULT_STATE)
+    ap.add_argument("--forward", default=DEFAULT_FORWARD)
     ap.add_argument("--report", default=DEFAULT_REPORT)
     ap.add_argument("--summary", default=DEFAULT_SUMMARY)
     args = ap.parse_args()
 
     signals = read_jsonl(args.signals)
     edges = read_jsonl(args.edges)
-    outcomes = load_outcomes(args.state)
+    outcomes = load_outcomes(args.state, args.forward)
     rows = enrich(signals, outcomes)
 
     risk_buckets = {b: rate_stats(rows, lambda r, b=b: bucket(r.get("risk_score")) == b) for b in ["00-20", "20-40", "40-60", "60-80", "80-100"]}
@@ -176,6 +190,7 @@ def main():
         "decision_proxy": decision_proxy,
         "top_bad_mothers": bad_mothers,
         "top_good_mothers": good_mothers,
+        "outcome_sources": dict(Counter(o.get("source", "unknown") for o in outcomes.values())),
         "live_allowed": False,
     }
     write_json(args.summary, summary)

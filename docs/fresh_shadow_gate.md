@@ -51,3 +51,21 @@ AVOID_DEV_CLUSTER catches known hard_stop/rug/dust rows
 FOLLOW_SHADOW_STRONG remains small/selective
 FOLLOW_SHADOW_CANDIDATE excludes high-risk shared mother clusters
 ```
+
+## Forward outcome requirement before canary
+
+Before any fresh/signal-based canary, run:
+
+```bash
+python3 scripts/fresh_forward_outcome_labeler.py
+python3 scripts/bundler_score_calibration_report.py
+```
+
+Required evidence:
+
+```text
+FOLLOW_SHADOW_STRONG win rate > baseline
+FOLLOW_SHADOW_STRONG hard_dump/rug rate lower than UNKNOWN_WAIT or high-risk clusters
+FOLLOW_SHADOW_CANDIDATE does not include high-risk shared-mother clusters
+no_trade_data is reported separately, not counted as a loss
+```
