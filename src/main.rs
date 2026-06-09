@@ -14,6 +14,7 @@ mod live_sell;
 mod notifier;
 mod paper_amm;
 mod position_manager;
+mod recovery;
 mod scout;
 mod sniper_shadow;
 mod state;
@@ -84,16 +85,87 @@ async fn main() -> anyhow::Result<()> {
 
     println!("🧬 huragan_core recovered boot | paper_mode={paper_mode} live_armed={live_armed} live_send={live_send} variants=F/I/Z/Z2/Z3/Z3.1");
 
-    if !paper_mode
-        && live_recovery::resume_open_live_holding_if_needed(
-            &rpc,
-            &rpc_url,
-            &ledger,
-            payer.as_ref(),
-        )
-        .await?
-    {
-        return Ok(());
+    // Recovery: detect open live holdings. Recovery attempts are best-effort
+    // and NEVER block the paper detection loop.
+    match recovery::latest_open_live_holding(&ledger) {
+        Ok(Some(holding)) => {
+            println!(
+                "LIVE HOLDING DETECTED: mint={} status={} tokens={}",
+                holding.mint, holding.status, holding.remaining_tokens
+            );
+            if paper_mode {
+                println!("📝 paper mode — live holding exists but recovery skipped");
+            } else {
+                match recovery::target_from_live_state(&holding) {
+                    Ok(target) => {
+                        let target_rec = target.clone();
+                        let rpc_url_rec = rpc_url.clone();
+                        let ledger_rec = ledger.clone();
+                        let holding_rec = holding.clone();
+                        tokio::spawn(async move {
+                            let key_bs58 = match std::env::var("SOLANA_PRIVATE_KEY_BASE58") {
+                                Ok(k) => k,
+                                Err(_) => {
+                                    eprintln!("⚠️ recovery sell skipped — no SOLANA_PRIVATE_KEY_BASE58");
+                                    return;
+                                }
+                            };
+                            let bytes = match bs58::decode(&key_bs58).into_vec() {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    eprintln!("⚠️ recovery sell: bs58 decode failed: {e}");
+                                    return;
+                                }
+                            };
+                            let payer_key = match Keypair::try_from(bytes.as_slice()) {
+                                Ok(k) => k,
+                                Err(e) => {
+                                    eprintln!("⚠️ recovery sell: invalid key: {e}");
+                                    return;
+                                }
+                            };
+                            let rpc_inner = RpcClient::new(rpc_url_rec.clone());
+                            let executor = executor::Executor::new(rpc_url_rec);
+                            let mut state = holding_rec;
+                            match crate::live_sell::run_z3_live_auto_sell_monitor(
+                                &rpc_inner,
+                                &executor,
+                                &ledger_rec,
+                                &target_rec,
+                                &mut state,
+                                &payer_key,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    println!("✅ recovery sell completed for {}", target_rec.mint);
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "⚠️ recovery sell failed for {}: {e}",
+                                        target_rec.mint
+                                    );
+                                }
+                            }
+                        });
+                        println!(
+                            "🔄 recovery sell dispatched for {}, continuing to paper detection",
+                            target.mint
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "⚠️ recovery target build failed for {}: {e}",
+                            holding.mint
+                        );
+                    }
+                }
+            }
+        }
+        Ok(None) => { /* no open holding — normal start */ }
+        Err(e) => {
+            eprintln!("⚠️ recovery check error: {e}");
+        }
     }
 
     while let Some(mut target) = rx.recv().await {
