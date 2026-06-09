@@ -417,9 +417,22 @@ fn decide(
             "safety_pass_without_v2_follow".into(),
         );
     }
+    // Safety pass but authority unverified or risk borderline — shadow observation only
+    if holder_ok
+        && !matches!(mint_info.mint_authority_active, Some(true))
+        && mint_info.freeze_authority_active != Some(true)
+        && risk < 70.0
+    {
+        return (
+            "WATCHLIST_CANDIDATE".into(),
+            format!("safety_pass_shadow_only:risk={risk:.1}:authority_unverified_or_borderline"),
+        );
+    }
     (
         "UNKNOWN_WAIT".into(),
-        "insufficient_safety_or_follow_confirmation".into(),
+        format!("insufficient_data:authority={}:{}/holder_ok={holder_ok}/risk={risk:.1}", 
+            authority_state(mint_info.mint_authority_active),
+            authority_state(mint_info.freeze_authority_active)),
     )
 }
 
@@ -526,7 +539,7 @@ fn write_report(path: &str, summary: &Value, gate_rows: &[Value]) -> anyhow::Res
     out.push_str("\n## Top candidate/watch rows\n\n| Mint | Decision | Risk | Follow | Shadow | Reason |\n|---|---|---:|---:|---|---|\n");
     for r in gate_rows
         .iter()
-        .filter(|r| matches!(strv(r, "decision"), "FOLLOW_CANDIDATE" | "SAFE_TO_WATCH"))
+        .filter(|r| matches!(strv(r, "decision"), "FOLLOW_CANDIDATE" | "SAFE_TO_WATCH" | "WATCHLIST_CANDIDATE"))
         .take(80)
     {
         out.push_str(&format!(
