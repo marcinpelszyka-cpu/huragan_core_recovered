@@ -8,6 +8,13 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+fn parse_ws_json_value(text: &str) -> Result<Value, serde_json::Error> {
+    match sonic_rs::from_str::<serde_json::Value>(text) {
+        Ok(v) => Ok(v),
+        Err(_) => serde_json::from_str::<Value>(text),
+    }
+}
+
 const PUMPPORTAL_EVENTS_PATH: &str = "pumpportal_migration_events.jsonl";
 
 pub async fn run_pumpportal_scout(tx: mpsc::Sender<MigrationTarget>) -> anyhow::Result<()> {
@@ -39,7 +46,7 @@ pub async fn run_pumpportal_scout(tx: mpsc::Sender<MigrationTarget>) -> anyhow::
                             break;
                         }
                     };
-                    if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                    if let Ok(v) = parse_ws_json_value(&text) {
                         record_pumpportal_event(&v);
                         if let Some(target) = parse_pumpportal_event(&v) {
                             let dedupe_key = if target.migration_signature.is_empty() {

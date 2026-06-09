@@ -3,10 +3,68 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+fn parse_ws_json_value(text: &str) -> Result<Value, serde_json::Error> {
+    match sonic_rs::from_str::<serde_json::Value>(text) {
+        Ok(v) => Ok(v),
+        Err(_) => serde_json::from_str::<Value>(text),
+    }
+}
+
+
+#[derive(Default)]
+struct HeliusScoutMetrics {
+    ws_messages_seen: u64,
+    ws_parse_fail: u64,
+    create_pool_candidates: u64,
+    get_transaction_count: u64,
+    get_transaction_ms_total: u128,
+    parse_target_count: u64,
+    parse_target_ms_total: u128,
+    helius_reconnect_count: u64,
+}
+
+impl HeliusScoutMetrics {
+    fn record_get_transaction_ms(&mut self, ms: u128) {
+        self.get_transaction_count += 1;
+        self.get_transaction_ms_total += ms;
+    }
+
+    fn record_parse_target_ms(&mut self, ms: u128) {
+        self.parse_target_count += 1;
+        self.parse_target_ms_total += ms;
+    }
+
+    fn maybe_log(&self) {
+        let interval = env_u64("HELIUS_WS_METRICS_EVERY", 1_000).max(1);
+        if self.ws_messages_seen == 0 || self.ws_messages_seen % interval != 0 {
+            return;
+        }
+        let get_avg = if self.get_transaction_count > 0 {
+            self.get_transaction_ms_total / self.get_transaction_count as u128
+        } else {
+            0
+        };
+        let parse_avg = if self.parse_target_count > 0 {
+            self.parse_target_ms_total / self.parse_target_count as u128
+        } else {
+            0
+        };
+        println!(
+            "📊 [HELIUS_METRICS] ws_messages_seen={} ws_parse_fail={} create_pool_candidates={} get_transaction_ms_avg={} parse_target_ms_avg={} helius_reconnect_count={}",
+            self.ws_messages_seen,
+            self.ws_parse_fail,
+            self.create_pool_candidates,
+            get_avg,
+            parse_avg,
+            self.helius_reconnect_count
+        );
+    }
+}
 
 const PUMP_AMM_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const DEBUG_UNPARSED_PATH: &str = "helius_unparsed_transactions.jsonl";
@@ -24,6 +82,7 @@ pub async fn run_helius_log_scout(tx: mpsc::Sender<MigrationTarget>) -> anyhow::
     let mut seen_migrations: HashSet<String> = HashSet::new();
     let mut seen_buys: HashSet<String> = HashSet::new();
     let mut buy_samples_written = 0u64;
+    let mut metrics = HeliusScoutMetrics::default();
     let mut reconnect_delay_secs = env_u64("HELIUS_WS_RECONNECT_INITIAL_SECS", 2).max(1);
     let reconnect_max_secs = env_u64("HELIUS_WS_RECONNECT_MAX_SECS", 300).max(reconnect_delay_secs);
 
@@ -49,16 +108,20 @@ pub async fn run_helius_log_scout(tx: mpsc::Sender<MigrationTarget>) -> anyhow::
                             break;
                         }
                     };
-                    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                    metrics.ws_messages_seen += 1;
+                    let Ok(v) = parse_ws_json_value(&text) else {
+                        metrics.ws_parse_fail += 1;
+                        metrics.maybe_log();
                         continue;
                     };
+                    metrics.maybe_log();
                     let Some(signature) = extract_signature(&v) else {
                         continue;
                     };
-                    let logs = extract_log_messages(&v);
+                    let buy_log = has_log_matching(&v, looks_like_buy_log_line);
                     if buy_capture_enabled
                         && buy_samples_written < buy_capture_limit
-                        && looks_like_buy_log(&logs)
+                        && buy_log
                         && seen_buys.insert(signature.clone())
                     {
                         match fetch_transaction_with_retry(&client, &rpc_url, &signature, "json")
@@ -81,9 +144,10 @@ pub async fn run_helius_log_scout(tx: mpsc::Sender<MigrationTarget>) -> anyhow::
                         }
                     }
 
-                    if !looks_like_create_pool_log(&logs) {
+                    if !has_log_matching(&v, looks_like_create_pool_log_line) {
                         continue;
                     }
+                    metrics.create_pool_candidates += 1;
                     if !seen_migrations.insert(signature.clone()) {
                         continue;
                     }
@@ -91,10 +155,16 @@ pub async fn run_helius_log_scout(tx: mpsc::Sender<MigrationTarget>) -> anyhow::
                         seen_migrations.clear();
                     }
 
+                    let get_started = Instant::now();
                     match fetch_transaction_with_retry(&client, &rpc_url, &signature, "jsonParsed")
                         .await
                     {
-                        Ok(tx_json) => match parse_pump_amm_transaction(&signature, &tx_json) {
+                        Ok(tx_json) => {
+                            metrics.record_get_transaction_ms(get_started.elapsed().as_millis());
+                            let parse_started = Instant::now();
+                            let parsed = parse_pump_amm_transaction(&signature, &tx_json);
+                            metrics.record_parse_target_ms(parse_started.elapsed().as_millis());
+                            match parsed {
                             Some(target) => {
                                 println!(
                                     "🎯 [HELIUS_MIGRATION] mint={} pool={} quote_asset={} base={} quote={} quote_vault={} coin_vault={}",
@@ -111,6 +181,7 @@ pub async fn run_helius_log_scout(tx: mpsc::Sender<MigrationTarget>) -> anyhow::
                             None => {
                                 write_unparsed(&signature, "parse_no_target", &tx_json);
                             }
+                        }
                         },
                         Err(e) => {
                             let debug = serde_json::json!({"signature": signature, "reason": format!("get_transaction_failed:{e}")});
@@ -135,6 +206,7 @@ pub async fn run_helius_log_scout(tx: mpsc::Sender<MigrationTarget>) -> anyhow::
                 continue;
             }
         }
+        metrics.helius_reconnect_count += 1;
         eprintln!("helius reconnect: backing off {reconnect_delay_secs}s after websocket drop");
         sleep(Duration::from_secs(reconnect_delay_secs)).await;
         reconnect_delay_secs = reconnect_delay_secs
@@ -152,29 +224,48 @@ fn extract_signature(v: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn extract_log_messages(v: &Value) -> Vec<String> {
+fn logs_array(v: &Value) -> Option<&Vec<Value>> {
     v.get("params")
         .and_then(|p| p.get("result"))
         .and_then(|r| r.get("value"))
         .and_then(|val| val.get("logs"))
         .and_then(|logs| logs.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|x| x.as_str().map(ToString::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
+}
+
+fn has_log_matching(v: &Value, pred: fn(&str) -> bool) -> bool {
+    logs_array(v)
+        .map(|arr| arr.iter().filter_map(|x| x.as_str()).any(pred))
+        .unwrap_or(false)
+}
+
+fn looks_like_create_pool_log_line(line: &str) -> bool {
+    contains_ascii_case_insensitive(line, "pool")
+        && (contains_ascii_case_insensitive(line, "create")
+            || contains_ascii_case_insensitive(line, "initialize"))
+}
+
+fn looks_like_buy_log_line(line: &str) -> bool {
+    line.contains("Instruction: Buy")
 }
 
 fn looks_like_create_pool_log(logs: &[String]) -> bool {
-    logs.iter().any(|l| {
-        let lower = l.to_ascii_lowercase();
-        (lower.contains("create") || lower.contains("initialize")) && lower.contains("pool")
-    })
+    logs.iter().any(|l| looks_like_create_pool_log_line(l))
 }
 
-fn looks_like_buy_log(logs: &[String]) -> bool {
-    logs.iter().any(|l| l.contains("Instruction: Buy"))
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() {
+        return true;
+    }
+    if n.len() > h.len() {
+        return false;
+    }
+    h.windows(n.len()).any(|w| {
+        w.iter()
+            .zip(n.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
 }
 
 async fn fetch_transaction_with_retry(

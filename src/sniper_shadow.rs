@@ -6,6 +6,13 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+fn parse_ws_json_value(text: &str) -> Result<Value, serde_json::Error> {
+    match sonic_rs::from_str::<serde_json::Value>(text) {
+        Ok(v) => Ok(v),
+        Err(_) => serde_json::from_str::<Value>(text),
+    }
+}
+
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const DEFAULT_OUT: &str = "sniper_follow_shadow.jsonl";
 
@@ -52,7 +59,7 @@ pub async fn run_sniper_shadow_daemon() -> anyhow::Result<()> {
                             break;
                         }
                     };
-                    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                    let Ok(v) = parse_ws_json_value(&text) else {
                         continue;
                     };
                     let Some(candidate) = parse_new_token_candidate(&v) else {

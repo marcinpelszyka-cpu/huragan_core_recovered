@@ -6,6 +6,13 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+fn parse_ws_json_value(text: &str) -> Result<Value, serde_json::Error> {
+    match sonic_rs::from_str::<serde_json::Value>(text) {
+        Ok(v) => Ok(v),
+        Err(_) => serde_json::from_str::<Value>(text),
+    }
+}
+
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
@@ -180,7 +187,7 @@ pub async fn run_fresh_momentum_daemon() -> anyhow::Result<()> {
                         Ok(_) => continue,
                         Err(_) => break,
                     };
-                    if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                    if let Ok(v) = parse_ws_json_value(&text) {
                         handle_event(
                             &mut ws,
                             &mut active,
