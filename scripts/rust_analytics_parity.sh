@@ -73,10 +73,18 @@ py=jsonl(base/'py/fresh_forward_outcomes.jsonl'); rs=jsonl(base/'rs/fresh_forwar
 assert_same('forward_rows', len(py), len(rs))
 assert_same('forward_labels', counts(py,'outcome_label'), counts(rs,'outcome_label'))
 for idx,(a,b) in enumerate(zip(py,rs)):
-    assert_same(f'forward_mint[{idx}]', a.get('mint'), b.get('mint'))
-    assert_same(f'forward_label[{idx}]', a.get('outcome_label'), b.get('outcome_label'))
+    if a.get('mint') != b.get('mint'):
+        raise SystemExit(f'forward_mint[{idx}]: DIFF PY={a.get("mint")} RS={b.get("mint")}')
+    if a.get('outcome_label') != b.get('outcome_label'):
+        raise SystemExit(f'forward_label[{idx}]: DIFF PY={a.get("outcome_label")} RS={b.get("outcome_label")}')
     for key in ('pnl_30s_pct','pnl_60s_pct','sell_flow_ratio_60s'):
-        assert_close(f'{key}[{idx}]', a.get(key), b.get(key))
+        av, bv = a.get(key), b.get(key)
+        if av is None or bv is None:
+            if av != bv:
+                raise SystemExit(f'{key}[{idx}]: DIFF PY={av} RS={bv}')
+        elif not math.isclose(float(av), float(bv), abs_tol=eps):
+            raise SystemExit(f'{key}[{idx}]: DIFF PY={av} RS={bv} eps={eps}')
+print(f'forward_row_level: OK rows={len(py)} eps={eps}')
 
 pyg=jsonl(base/'py/fresh_shadow_gate_signals.jsonl'); rsg=jsonl(base/'rs/fresh_shadow_gate_signals.jsonl')
 assert_same('gate_rows', len(pyg), len(rsg))
