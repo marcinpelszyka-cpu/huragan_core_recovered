@@ -1,9 +1,22 @@
 #![allow(dead_code)]
+use rayon::prelude::*;
+use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+
+pub const FLOAT_EPSILON: f64 = 1e-6;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JsonlReadReport {
+    pub path: String,
+    pub rows_seen: usize,
+    pub rows_ok: usize,
+    pub rows_skipped_empty: usize,
+    pub rows_skipped_parse_error: usize,
+}
 
 pub fn f64v(v: Option<&Value>, default: f64) -> f64 {
     match v {
@@ -39,23 +52,125 @@ pub fn strv<'a>(row: &'a Value, key: &str) -> &'a str {
     row.get(key).and_then(|v| v.as_str()).unwrap_or("")
 }
 
+pub fn approx_eq(a: f64, b: f64) -> bool {
+    (a - b).abs() <= FLOAT_EPSILON
+}
+
 pub fn read_jsonl(path: &str) -> Vec<Value> {
+    read_jsonl_with_report(path).0
+}
+
+pub fn read_jsonl_with_report(path: &str) -> (Vec<Value>, JsonlReadReport) {
+    let mut report = JsonlReadReport {
+        path: path.to_string(),
+        ..Default::default()
+    };
     let p = Path::new(path);
     if !p.exists() {
-        return vec![];
+        return (vec![], report);
     }
     let Ok(file) = File::open(p) else {
-        return vec![];
+        return (vec![], report);
     };
-    BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
+    let mut out = Vec::new();
+    for (idx, line) in BufReader::new(file).lines().enumerate() {
+        report.rows_seen += 1;
+        let Ok(line) = line else {
+            report.rows_skipped_parse_error += 1;
+            eprintln!(
+                "[analytics] jsonl read failed path={} row={}",
+                path,
+                idx + 1
+            );
+            continue;
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            report.rows_skipped_empty += 1;
+            continue;
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(v) => {
+                report.rows_ok += 1;
+                out.push(v);
+            }
+            Err(e) => {
+                report.rows_skipped_parse_error += 1;
+                eprintln!(
+                    "[analytics] jsonl parse failed path={} row={} err={}; skipping",
+                    path,
+                    idx + 1,
+                    e
+                );
+            }
+        }
+    }
+    (out, report)
+}
+
+pub fn process_jsonl_stream<T, F>(path: &str, mut handler: F) -> JsonlReadReport
+where
+    T: DeserializeOwned,
+    F: FnMut(T),
+{
+    let mut report = JsonlReadReport {
+        path: path.to_string(),
+        ..Default::default()
+    };
+    let p = Path::new(path);
+    if !p.exists() {
+        return report;
+    }
+    let Ok(file) = File::open(p) else {
+        return report;
+    };
+    for (idx, line) in BufReader::new(file).lines().enumerate() {
+        report.rows_seen += 1;
+        let Ok(line) = line else {
+            report.rows_skipped_parse_error += 1;
+            eprintln!(
+                "[analytics] jsonl read failed path={} row={}",
+                path,
+                idx + 1
+            );
+            continue;
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            report.rows_skipped_empty += 1;
+            continue;
+        }
+        match serde_json::from_str::<T>(line) {
+            Ok(record) => {
+                report.rows_ok += 1;
+                handler(record);
+            }
+            Err(e) => {
+                report.rows_skipped_parse_error += 1;
+                eprintln!(
+                    "[analytics] jsonl parse failed path={} row={} err={}; skipping",
+                    path,
+                    idx + 1,
+                    e
+                );
+            }
+        }
+    }
+    report
+}
+
+pub fn process_jsonl_parallel<T>(raw_file_content: &str) -> Vec<T>
+where
+    T: DeserializeOwned + Send,
+{
+    raw_file_content
+        .par_lines()
         .filter_map(|line| {
             let line = line.trim();
             if line.is_empty() {
                 None
             } else {
-                serde_json::from_str::<Value>(line).ok()
+                serde_json::from_str::<T>(line).ok()
             }
         })
         .collect()
@@ -143,4 +258,21 @@ pub fn arg_value(args: &[String], name: &str, default: &str) -> String {
 
 pub fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approx_float_uses_epsilon() {
+        assert!(approx_eq(0.3, 0.3000004));
+        assert!(!approx_eq(0.3, 0.30001));
+    }
+
+    #[test]
+    fn parallel_jsonl_skips_bad_rows() {
+        let rows: Vec<Value> = process_jsonl_parallel("{\"a\":1}\nBAD\n{\"a\":2}\n");
+        assert_eq!(rows.len(), 2);
+    }
 }
