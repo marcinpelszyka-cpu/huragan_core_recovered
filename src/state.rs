@@ -138,6 +138,19 @@ pub struct PositionState {
     #[serde(default)]
     pub live_sell_family: String,
     #[serde(default)]
+    pub lifecycle_id: String,
+    #[serde(default)]
+    pub lifecycle_phase: String,
+    #[serde(default)]
+    pub buy_attempt_no: u64,
+    #[serde(default)]
+    pub sell_attempt_no: u64,
+    #[serde(default)]
+    pub terminal_reason: String,
+    #[serde(default)]
+    pub rollback_required: bool,
+
+    #[serde(default)]
     pub live_send_backend: String,
     #[serde(default)]
     pub live_send_day: String,
