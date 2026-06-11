@@ -26,7 +26,7 @@ pub fn validate_onchain_diagnostic_allowed(
     if !env_bool("AMM_LIVE_CANARY", false) {
         return Err("diagnostic_requires_canary".into());
     }
-    if env_f64("BUY_AMOUNT_SOL", 0.003) > 0.003 {
+    if env_f64("BUY_AMOUNT_SOL", 0.01) > 0.01 {
         return Err("diagnostic_buy_amount_too_large".into());
     }
     if env_u64("MAX_TRADES_PER_RUN", 1) != 1 {
@@ -118,8 +118,8 @@ pub fn validate_live_start(paper_mode: bool, live_armed: bool) -> anyhow::Result
             anyhow::bail!("AMM CANARY BLOCKED: {k} must be {v}");
         }
     }
-    if env_f64("BUY_AMOUNT_SOL", 0.003) > 0.003 {
-        anyhow::bail!("AMM CANARY BLOCKED: BUY_AMOUNT_SOL must be <= 0.003");
+    if env_f64("BUY_AMOUNT_SOL", 0.01) > 0.01 {
+        anyhow::bail!("AMM CANARY BLOCKED: BUY_AMOUNT_SOL must be <= 0.01");
     }
     if env::var("LIVE_VARIANT").unwrap_or_else(|_| "Z".into()) != "Z3" {
         anyhow::bail!("AMM CANARY BLOCKED: LIVE_VARIANT must be Z3");
@@ -148,5 +148,13 @@ pub fn validate_live_start(paper_mode: bool, live_armed: bool) -> anyhow::Result
             anyhow::bail!("AMM CANARY BLOCKED: LIVE_SELL_SEND_ENABLED must be true for live send");
         }
     }
+
+    // --- LiveRiskManager v1 ---
+    if env_bool("LIVE_RISK_MANAGER_ENABLED", true) {
+        let risk_ledger = LedgerManager::default();
+        crate::live_risk::validate_live_risk(&risk_ledger)
+            .map_err(|e| anyhow::anyhow!("AMM CANARY BLOCKED: {e}"))?;
+    }
+
     Ok(())
 }

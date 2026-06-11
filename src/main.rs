@@ -10,6 +10,7 @@ mod live_env;
 mod live_guards;
 mod live_lifecycle;
 mod live_recovery;
+mod live_risk;
 mod live_sell;
 mod notifier;
 mod paper_amm;
@@ -723,7 +724,7 @@ mod tests {
             "https://sender.helius-rpc.com/fast?swqos_only=true",
         );
         std::env::set_var("HELIUS_SENDER_TIP_LAMPORTS", "5000");
-        std::env::set_var("HELIUS_SENDER_MAX_PER_DAY", "2");
+        std::env::set_var("HELIUS_SENDER_MAX_PER_DAY", "100");
 
         validate_live_start(false, true).unwrap();
         clear_live_env();
@@ -983,6 +984,7 @@ mod tests {
         std::env::set_var("EMERGENCY_JITO_TIP_LAMPORTS", "0");
         std::env::set_var("BUY_AMOUNT_SOL", "0.003");
         std::env::set_var("LIVE_VARIANT", "Z3");
+        std::env::set_var("LIVE_RISK_MANAGER_ENABLED", "false");
     }
 
     fn clear_live_env() {
@@ -1007,6 +1009,7 @@ mod tests {
             "HELIUS_SENDER_MAX_PER_DAY",
             "HELIUS_SENDER_CU_LIMIT",
             "HELIUS_SENDER_CU_PRICE_MICRO_LAMPORTS",
+            "LIVE_RISK_MANAGER_ENABLED",
         ] {
             std::env::remove_var(key);
         }

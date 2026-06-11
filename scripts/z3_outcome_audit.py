@@ -257,7 +257,7 @@ def write_csv(path: Path, rows, fields):
             w.writerow(r)
 
 
-def write_report(path: Path, metrics, bands, canaries, blockers, state_path):
+def write_report(path: Path, metrics, bands, canaries, blockers, risk_status, state_path):
     path.parent.mkdir(parents=True, exist_ok=True)
     z3 = next((r for r in metrics if r.get("variant_id") == "Z3"), None)
     z = next((r for r in metrics if r.get("variant_id") == "Z"), None)
@@ -265,6 +265,12 @@ def write_report(path: Path, metrics, bands, canaries, blockers, state_path):
     with path.open("w") as f:
         f.write("# Z3 Outcome Audit\n\n")
         f.write(f"Input state: `{state_path}`\n\n")
+        f.write("## Risk Manager\n\n")
+        f.write(f"- status: **{risk_status['status']}**\n")
+        f.write(f"- daily PnL: {risk_status['daily_pnl']:.9f} SOL\n")
+        f.write(f"- daily trades: {risk_status['daily_trades']}\n")
+        f.write(f"- consecutive losses: {risk_status['consecutive_losses']}\n")
+        f.write(f"- gate pass rate: {risk_status['gate_pass_rate']:.1f}% ({risk_status['gate_passed']}/{risk_status['gate_total']})\n\n")
         f.write("## Decision gate\n\n")
         if blockers:
             f.write(f"- **NO_GO**: open live blockers = {len(blockers)}\n")
@@ -308,6 +314,60 @@ def write_report(path: Path, metrics, bands, canaries, blockers, state_path):
         f.write("- No secrets, no .env, no signing, no live execution.\n")
 
 
+def risk_manager_status(rows):
+    """Compute LiveRiskManager v1 status from state.jsonl."""
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    live = [r for r in rows if is_live_row(r)]
+    latest = list(latest_by(live, lambda r: (r.get("mint"), r.get("variant_id", "")) if r.get("mint") else None).values())
+
+    today_rows = [r for r in latest if r.get("live_send_day") == today]
+    daily_pnl = sum(fnum(r.get("realized_pnl_sol") or r.get("net_pnl_sol")) for r in today_rows)
+    daily_trades = sum(1 for r in today_rows if r.get("status") in {"completed", "live_failed", "unrecoverable_dust_or_rug"})
+    has_sell_failed = any(r.get("status") == "live_sell_failed_retryable" for r in today_rows)
+
+    sorted_rows = sorted(latest, key=lambda r: r.get("timestamp", ""))
+    consecutive = 0
+    for r in reversed(sorted_rows):
+        if r.get("status") in {"completed", "unrecoverable_dust_or_rug"}:
+            if fnum(r.get("realized_pnl_sol") or r.get("net_pnl_sol")) <= 0 or r.get("status") == "unrecoverable_dust_or_rug":
+                consecutive += 1
+            else:
+                break
+        elif r.get("status") == "live_failed":
+            consecutive += 1
+        else:
+            break
+
+    gate_passed = sum(1 for r in latest if r.get("quote_reserve_ui", 0) >= 100)
+    gate_total = len([r for r in latest if r.get("quote_reserve_ui", 0) > 0])
+    gate_rate = (gate_passed / gate_total * 100) if gate_total > 0 else 0.0
+
+    blockers = []
+    if daily_pnl <= -0.01:
+        blockers.append("daily_loss_limit")
+    if daily_trades >= 10:
+        blockers.append("daily_trade_limit")
+    if consecutive >= 3:
+        blockers.append("consecutive_loss_limit")
+    if has_sell_failed:
+        blockers.append("live_sell_failed_today")
+    if len(open_live_blockers(rows)) > 0:
+        blockers.append("open_blockers")
+
+    status = "NO_GO:" + ",".join(blockers) if blockers else "GO"
+    return {
+        "status": status,
+        "daily_pnl": daily_pnl,
+        "daily_trades": daily_trades,
+        "consecutive_losses": consecutive,
+        "gate_passed": gate_passed,
+        "gate_total": gate_total,
+        "gate_pass_rate": gate_rate,
+        "blockers": blockers,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description="Offline Z3 outcome audit")
     ap.add_argument("--state", default="state.jsonl")
@@ -325,6 +385,7 @@ def main():
     bands = mfe_band_rows(clean, "Z3")
     canaries = canary_rows(rows)
     blockers = open_live_blockers(rows)
+    risk = risk_manager_status(rows)
 
     write_csv(out / "z3_variant_outcome_metrics.csv", metrics, [
         "variant_id", "n", "wr_pct", "avg_pnl_pct", "median_pnl_pct", "total_sol",
@@ -338,10 +399,11 @@ def main():
     write_csv(out / "z3_live_canary_ledger.csv", canaries, [
         "mint", "outcome_category", "status", "buy_tx", "sell_tx", "exit_reason", "hold_secs", "pnl_sol", "pnl_pct", "remaining_tokens", "terminal",
     ])
-    write_report(out / "z3_outcome_audit.md", metrics, bands, canaries, blockers, state_path)
+    write_report(out / "z3_outcome_audit.md", metrics, bands, canaries, blockers, risk, state_path)
 
     z3 = next((r for r in metrics if r.get("variant_id") == "Z3"), None)
     print(f"rows={len(rows)} clean_paper={len(clean)} canaries={len(canaries)} open_live_blockers={len(blockers)}")
+    print(f"risk_manager={risk['status']} daily_pnl={risk['daily_pnl']:.9f} daily_trades={risk['daily_trades']} consecutive_losses={risk['consecutive_losses']}")
     if z3:
         print(f"Z3 n={z3['n']} WR={z3['wr_pct']:.1f}% avg={z3['avg_pnl_pct']:.2f}% median={z3['median_pnl_pct']:.2f}% total={z3['total_sol']:.9f} SOL")
     print(f"wrote {out / 'z3_outcome_audit.md'}")
