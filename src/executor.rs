@@ -319,7 +319,7 @@ pub fn validate_sender_tip(
 }
 
 pub fn helius_sender_max_per_day() -> usize {
-    env_u64("HELIUS_SENDER_MAX_PER_DAY", 2).clamp(0, 10) as usize
+    env_u64("HELIUS_SENDER_MAX_PER_DAY", 50).clamp(0, 100) as usize
 }
 
 pub fn wrap_sender_instructions(

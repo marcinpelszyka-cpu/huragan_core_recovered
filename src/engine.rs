@@ -211,7 +211,7 @@ pub fn min_out_from_bps(expected: u64, bps: u64) -> u64 {
 }
 
 pub fn min_pool_sol_for_entry_lamports() -> u64 {
-    env_u64("AMM_MIN_POOL_SOL_FOR_ENTRY_LAMPORTS", 100_000_000_000)
+    env_u64("AMM_MIN_POOL_SOL_FOR_ENTRY_LAMPORTS", 500_000_000_000)
 }
 
 pub async fn check_pool_sol_gate(rpc: &RpcClient, target: &MigrationTarget) -> anyhow::Result<()> {
