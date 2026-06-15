@@ -2,7 +2,11 @@ use crate::engine::{MigrationTarget, QuoteAsset};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -15,7 +19,6 @@ fn parse_ws_json_value(text: &str) -> Result<Value, serde_json::Error> {
     }
 }
 
-
 #[derive(Default)]
 struct HeliusScoutMetrics {
     ws_messages_seen: u64,
@@ -26,6 +29,9 @@ struct HeliusScoutMetrics {
     parse_target_count: u64,
     parse_target_ms_total: u128,
     helius_reconnect_count: u64,
+    ws_ping_sent: u64,
+    ws_pong_seen: u64,
+    last_subscription_id: Option<u64>,
 }
 
 impl HeliusScoutMetrics {
@@ -55,13 +61,18 @@ impl HeliusScoutMetrics {
             0
         };
         println!(
-            "📊 [HELIUS_METRICS] ws_messages_seen={} ws_parse_fail={} create_pool_candidates={} get_transaction_ms_avg={} parse_target_ms_avg={} helius_reconnect_count={}",
+            "📊 [HELIUS_METRICS] ws_messages_seen={} ws_parse_fail={} create_pool_candidates={} get_transaction_ms_avg={} parse_target_ms_avg={} helius_reconnect_count={} ws_ping_sent={} ws_pong_seen={} subscription_id={}",
             self.ws_messages_seen,
             self.ws_parse_fail,
             self.create_pool_candidates,
             get_avg,
             parse_avg,
-            self.helius_reconnect_count
+            self.helius_reconnect_count,
+            self.ws_ping_sent,
+            self.ws_pong_seen,
+            self.last_subscription_id
+                .map(|x| x.to_string())
+                .unwrap_or_else(|| "unknown".into())
         );
     }
 }
@@ -85,26 +96,111 @@ pub async fn run_helius_log_scout(tx: mpsc::Sender<MigrationTarget>) -> anyhow::
     let mut metrics = HeliusScoutMetrics::default();
     let mut reconnect_delay_secs = env_u64("HELIUS_WS_RECONNECT_INITIAL_SECS", 2).max(1);
     let reconnect_max_secs = env_u64("HELIUS_WS_RECONNECT_MAX_SECS", 300).max(reconnect_delay_secs);
+    let mut reconnect_events: VecDeque<Instant> = VecDeque::new();
 
     loop {
+        maybe_controlled_reconnect_cooldown(&mut reconnect_events).await;
+        let mut count_reconnect_for_watchdog = true;
         match connect_async(&ws_url).await {
-            Ok((mut ws, _)) => {
+            Ok((ws, _)) => {
                 reconnect_delay_secs = env_u64("HELIUS_WS_RECONNECT_INITIAL_SECS", 2).max(1);
+                let (mut ws_tx, mut ws_rx) = ws.split();
                 let sub = serde_json::json!({
                     "jsonrpc":"2.0",
                     "id":1,
                     "method":"logsSubscribe",
                     "params":[{"mentions":[PUMP_AMM_PROGRAM]},{"commitment":"processed"}]
                 });
-                ws.send(Message::Text(sub.to_string().into())).await?;
-                println!("📡 [HELIUS] subscribed Pump AMM logs");
+                ws_tx.send(Message::Text(sub.to_string().into())).await?;
+                let mut subscribed = true;
+                let reconnect_reason: String;
+                let ping_interval =
+                    Duration::from_secs(env_u64("HELIUS_WS_PING_INTERVAL_SECS", 30).max(5));
+                let ping_timeout =
+                    Duration::from_secs(env_u64("HELIUS_WS_PING_TIMEOUT_SECS", 10).max(3));
+                let heartbeat_ping_sent = Arc::new(AtomicU64::new(0));
+                let heartbeat_pong_seen = Arc::new(AtomicU64::new(0));
+                let last_ping_sent = Arc::new(tokio::sync::Mutex::new(None::<Instant>));
+                let (heartbeat_err_tx, mut heartbeat_err_rx) = mpsc::unbounded_channel::<String>();
+                let heartbeat_task = {
+                    let heartbeat_ping_sent = Arc::clone(&heartbeat_ping_sent);
+                    let heartbeat_pong_seen = Arc::clone(&heartbeat_pong_seen);
+                    let last_ping_sent = Arc::clone(&last_ping_sent);
+                    tokio::spawn(async move {
+                        loop {
+                            sleep(ping_interval).await;
+                            let sent = heartbeat_ping_sent.load(Ordering::Relaxed);
+                            let seen = heartbeat_pong_seen.load(Ordering::Relaxed);
+                            if sent.saturating_sub(seen) >= 3 {
+                                let _ = heartbeat_err_tx.send(format!(
+                                    "heartbeat_timeout missed_pongs={} ping_timeout_secs={}",
+                                    sent.saturating_sub(seen),
+                                    ping_timeout.as_secs()
+                                ));
+                                break;
+                            }
+                            match ws_tx.send(Message::Ping(Vec::new().into())).await {
+                                Ok(_) => {
+                                    heartbeat_ping_sent.fetch_add(1, Ordering::Relaxed);
+                                    *last_ping_sent.lock().await = Some(Instant::now());
+                                    eprintln!("[HELIUS_WS] heartbeat_ping_sent");
+                                }
+                                Err(e) => {
+                                    let _ = heartbeat_err_tx
+                                        .send(format!("heartbeat_ping_send_failed:{e}"));
+                                    break;
+                                }
+                            }
+                        }
+                    })
+                };
+                println!(
+                    "📡 [HELIUS] subscribed Pump AMM logs request_id=1 duplicate_guard=active"
+                );
 
-                while let Some(msg) = ws.next().await {
+                loop {
+                    metrics.ws_ping_sent = heartbeat_ping_sent.load(Ordering::Relaxed);
+                    metrics.ws_pong_seen = heartbeat_pong_seen.load(Ordering::Relaxed);
+                    let msg = tokio::select! {
+                        err = heartbeat_err_rx.recv() => {
+                            reconnect_reason = err.unwrap_or_else(|| "heartbeat_task_ended".into());
+                            break;
+                        }
+                        msg = ws_rx.next() => match msg {
+                            Some(msg) => msg,
+                            None => {
+                                reconnect_reason = "stream_ended".into();
+                                break;
+                            }
+                        }
+                    };
+
                     let text = match msg {
                         Ok(Message::Text(t)) => t.to_string(),
+                        Ok(Message::Ping(_payload)) => {
+                            // tungstenite queues an automatic Pong while the read loop is polled;
+                            // avoid manual duplicate pongs and let periodic client Ping prove liveness.
+                            continue;
+                        }
+                        Ok(Message::Pong(_)) => {
+                            heartbeat_pong_seen.fetch_add(1, Ordering::Relaxed);
+                            metrics.ws_pong_seen = heartbeat_pong_seen.load(Ordering::Relaxed);
+                            if let Some(sent_at) = last_ping_sent.lock().await.take() {
+                                eprintln!(
+                                    "[HELIUS_WS] heartbeat_pong_seen rtt_ms={}",
+                                    sent_at.elapsed().as_millis()
+                                );
+                            }
+                            continue;
+                        }
+                        Ok(Message::Close(frame)) => {
+                            reconnect_reason = format!("close_frame:{frame:?}");
+                            break;
+                        }
                         Ok(_) => continue,
                         Err(e) => {
-                            eprintln!("⚠️ [HELIUS] websocket drop: {e}");
+                            reconnect_reason = format!("stream_error:{e}");
+                            eprintln!("⚠️ [HELIUS] websocket drop reason={reconnect_reason}");
                             break;
                         }
                     };
@@ -114,6 +210,16 @@ pub async fn run_helius_log_scout(tx: mpsc::Sender<MigrationTarget>) -> anyhow::
                         metrics.maybe_log();
                         continue;
                     };
+                    if let Some(sub_id) = extract_subscription_id(&v) {
+                        metrics.last_subscription_id = Some(sub_id);
+                        println!("📡 [HELIUS] subscription_ack id={sub_id}");
+                        continue;
+                    }
+                    if is_duplicate_subscription_error(&v) {
+                        subscribed = false;
+                        reconnect_reason = format!("duplicate_subscription_guard:{v}");
+                        break;
+                    }
                     metrics.maybe_log();
                     let Some(signature) = extract_signature(&v) else {
                         continue;
@@ -165,8 +271,8 @@ pub async fn run_helius_log_scout(tx: mpsc::Sender<MigrationTarget>) -> anyhow::
                             let parsed = parse_pump_amm_transaction(&signature, &tx_json);
                             metrics.record_parse_target_ms(parse_started.elapsed().as_millis());
                             match parsed {
-                            Some(target) => {
-                                println!(
+                                Some(target) => {
+                                    println!(
                                     "🎯 [HELIUS_MIGRATION] mint={} pool={} quote_asset={} base={} quote={} quote_vault={} coin_vault={}",
                                     target.mint,
                                     target.pool_state,
@@ -176,28 +282,42 @@ pub async fn run_helius_log_scout(tx: mpsc::Sender<MigrationTarget>) -> anyhow::
                                     target.pool_base_token_account,
                                     target.pool_quote_token_account
                                 );
-                                let _ = tx.send(target).await;
-                            }
-                            None => {
-                                write_unparsed(&signature, "parse_no_target", &tx_json);
+                                    let _ = tx.send(target).await;
+                                }
+                                None => {
+                                    write_unparsed(&signature, "parse_no_target", &tx_json);
+                                }
                             }
                         }
-                        },
                         Err(e) => {
                             let debug = serde_json::json!({"signature": signature, "reason": format!("get_transaction_failed:{e}")});
                             let _ = crate::state::append_jsonl(DEBUG_UNPARSED_PATH, &debug);
                         }
                     }
                 }
+                heartbeat_task.abort();
+                metrics.ws_ping_sent = heartbeat_ping_sent.load(Ordering::Relaxed);
+                metrics.ws_pong_seen = heartbeat_pong_seen.load(Ordering::Relaxed);
+                eprintln!(
+                    "helius reconnect_reason={reconnect_reason} subscribed={subscribed} subscription_id={}",
+                    metrics
+                        .last_subscription_id
+                        .map(|x| x.to_string())
+                        .unwrap_or_else(|| "unknown".into())
+                );
+                if is_normal_away_close(&reconnect_reason) {
+                    count_reconnect_for_watchdog = false;
+                }
             }
             Err(e) => {
                 let msg = e.to_string();
+                reconnect_events.push_back(Instant::now());
                 if is_rate_limited_error(&msg) {
                     eprintln!(
-                        "helius reconnect rate_limited: backing off {reconnect_delay_secs}s: {e}"
+                        "helius reconnect_reason=connect_rate_limited backing_off={reconnect_delay_secs}s err={e}"
                     );
                 } else {
-                    eprintln!("helius reconnect: backing off {reconnect_delay_secs}s: {e}");
+                    eprintln!("helius reconnect_reason=connect_error backing_off={reconnect_delay_secs}s err={e}");
                 }
                 sleep(Duration::from_secs(reconnect_delay_secs)).await;
                 reconnect_delay_secs = reconnect_delay_secs
@@ -207,6 +327,9 @@ pub async fn run_helius_log_scout(tx: mpsc::Sender<MigrationTarget>) -> anyhow::
             }
         }
         metrics.helius_reconnect_count += 1;
+        if count_reconnect_for_watchdog {
+            reconnect_events.push_back(Instant::now());
+        }
         eprintln!("helius reconnect: backing off {reconnect_delay_secs}s after websocket drop");
         sleep(Duration::from_secs(reconnect_delay_secs)).await;
         reconnect_delay_secs = reconnect_delay_secs
@@ -222,6 +345,50 @@ fn extract_signature(v: &Value) -> Option<String> {
         .get("signature")?
         .as_str()
         .map(ToString::to_string)
+}
+
+fn is_normal_away_close(reason: &str) -> bool {
+    reason.contains("close_frame") && reason.contains("code: Away")
+}
+
+fn extract_subscription_id(v: &Value) -> Option<u64> {
+    if v.get("id").and_then(|id| id.as_u64()) == Some(1) {
+        return v.get("result").and_then(|r| r.as_u64());
+    }
+    None
+}
+
+fn is_duplicate_subscription_error(v: &Value) -> bool {
+    let Some(err) = v.get("error") else {
+        return false;
+    };
+    let text = err.to_string().to_ascii_lowercase();
+    text.contains("duplicate") || text.contains("already subscribed")
+}
+
+async fn maybe_controlled_reconnect_cooldown(reconnect_events: &mut VecDeque<Instant>) {
+    let window_secs = env_u64("HELIUS_WS_RECONNECT_WATCHDOG_WINDOW_SECS", 900).max(60);
+    let max_in_window = env_u64("HELIUS_WS_RECONNECT_WATCHDOG_MAX", 2).max(1) as usize;
+    let cooldown_secs = env_u64("HELIUS_WS_RECONNECT_WATCHDOG_COOLDOWN_SECS", 180).max(10);
+    let now = Instant::now();
+    while reconnect_events
+        .front()
+        .map(|t| now.duration_since(*t) > Duration::from_secs(window_secs))
+        .unwrap_or(false)
+    {
+        reconnect_events.pop_front();
+    }
+    if reconnect_events.len() > max_in_window {
+        eprintln!(
+            "helius reconnect_reason=controlled_watchdog cooldown={}s recent_reconnects={}/{} window={}s",
+            cooldown_secs,
+            reconnect_events.len(),
+            max_in_window,
+            window_secs
+        );
+        sleep(Duration::from_secs(cooldown_secs)).await;
+        reconnect_events.clear();
+    }
 }
 
 fn logs_array(v: &Value) -> Option<&Vec<Value>> {
