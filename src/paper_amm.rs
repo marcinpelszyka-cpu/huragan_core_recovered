@@ -1,4 +1,5 @@
 use crate::engine::{self, MigrationTarget};
+use crate::live_env::env_bool;
 use crate::state::{LedgerManager, PositionState};
 use crate::strategy::StrategyVariant;
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -210,6 +211,26 @@ pub fn spawn_lifecycle(
                 .await;
                 return;
             }
+            // TASK_07: V2 distribution exit — pump reversing after 50%+ MFE
+            if env_bool("Z3_EXIT_POLICY_V2", false)
+                && max_favorable_pct >= 50.0
+                && current_pnl_pct < max_favorable_pct * 0.3
+            {
+                finalize(
+                    &rpc,
+                    &target,
+                    &ledger,
+                    &mut state,
+                    "distribution",
+                    age,
+                    current,
+                    simulated_sells + 1,
+                    highest,
+                    lowest,
+                )
+                .await;
+                return;
+            }
             if variant.stop_loss_ratio > 0.0 && ratio <= variant.stop_loss_ratio {
                 finalize(
                     &rpc,
@@ -217,6 +238,30 @@ pub fn spawn_lifecycle(
                     &ledger,
                     &mut state,
                     "hard_stop",
+                    age,
+                    current,
+                    simulated_sells + 1,
+                    highest,
+                    lowest,
+                )
+                .await;
+                return;
+            }
+            // TASK_07: V2 controlled pump exit.
+            // Units: max_favorable_pct and current_pnl_pct are both percentages.
+            // Example: MFE=30%, exit if current PnL < 21% (30 * 0.70).
+            if env_bool("Z3_EXIT_POLICY_V2", false)
+                && variant.id == "Z3"
+                && max_favorable_pct >= 25.0
+                && max_favorable_pct < 50.0
+                && current_pnl_pct < max_favorable_pct * 0.70
+            {
+                finalize(
+                    &rpc,
+                    &target,
+                    &ledger,
+                    &mut state,
+                    "controlled_pump_exit",
                     age,
                     current,
                     simulated_sells + 1,
@@ -283,7 +328,13 @@ pub fn spawn_lifecycle(
 }
 
 fn z3_mfe_gate_exit(variant: &StrategyVariant, age_secs: u64, max_favorable_pct: f64) -> bool {
-    variant.id == "Z3" && age_secs >= 120 && max_favorable_pct < 25.0
+    // TASK_07: V2 policy uses stricter 10% threshold (was 25%)
+    let threshold = if env_bool("Z3_EXIT_POLICY_V2", false) {
+        10.0
+    } else {
+        25.0
+    };
+    variant.id == "Z3" && age_secs >= 120 && max_favorable_pct < threshold
 }
 
 fn z3_staged_profit_protect_exit(
