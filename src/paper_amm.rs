@@ -1,5 +1,6 @@
 use crate::engine::{self, MigrationTarget};
 use crate::live_env::env_bool;
+use crate::live_lifecycle::z3_exit_v3_shadow_reason;
 use crate::state::{LedgerManager, PositionState};
 use crate::strategy::StrategyVariant;
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -82,8 +83,13 @@ pub fn spawn_lifecycle(
             .unwrap_or(1000);
         let mut highest = 1.0f64;
         let mut lowest = 1.0f64;
+        let mut last_high_age = 0u64;
         let mut simulated_sells = 0u64;
         let mut last_value = 0.0f64;
+        let mut last_valid_quote_age_secs = 0u64;
+        let mut quote_error_count = 0u64;
+        let mut quote_retry_count = 0u64;
+        let mut quote_failure_stage = String::new();
         let mut partial_done = false;
 
         loop {
@@ -94,10 +100,42 @@ pub fn spawn_lifecycle(
             let current = match sell {
                 Ok(plan) => {
                     state.paper_sell_family = plan.instruction_family;
-                    plan.expected_sol_out as f64 / 1e9
+                    quote_failure_stage.clear();
+                    let value = plan.expected_sol_out as f64 / 1e9;
+                    if value.is_finite() && value > 0.0 {
+                        last_valid_quote_age_secs = age;
+                    }
+                    value
                 }
                 Err(_) => {
+                    quote_error_count = quote_error_count.saturating_add(1);
+                    quote_retry_count = quote_retry_count.saturating_add(1);
+                    quote_failure_stage = if age >= variant.max_hold_secs {
+                        "max_hold_finalize".into()
+                    } else {
+                        "position_management_retry".into()
+                    };
                     if age >= variant.max_hold_secs {
+                        state.quote_unavailable = true;
+                        state.valuation_uncertain = true;
+                        state.exit_affected = true;
+                        state.metrics_eligible = last_value.is_finite() && last_value > 0.0;
+                        state.exit_design_eligible = false;
+                        state.last_valid_value_sol = last_value;
+                        state.last_valid_quote_sol = last_value;
+                        state.last_valid_quote_age_secs =
+                            age.saturating_sub(last_valid_quote_age_secs);
+                        state.quote_error_count = quote_error_count;
+                        state.quote_retry_count = quote_retry_count;
+                        state.quote_failure_stage = quote_failure_stage.clone();
+                        state.quote_source = "build_sell_amm_ixs".into();
+                        state.fallback_used = true;
+                        state.fallback_reason = "quote_unavailable_at_max_hold".into();
+                        state.quote_reason_codes = vec![
+                            "quote_unavailable".into(),
+                            "terminal_quote_failure".into(),
+                            "fallback_last_valid_value".into(),
+                        ];
                         finalize(
                             &rpc,
                             &target,
@@ -109,6 +147,7 @@ pub fn spawn_lifecycle(
                             simulated_sells,
                             highest,
                             lowest,
+                            age.saturating_sub(last_high_age),
                         )
                         .await;
                         return;
@@ -132,7 +171,10 @@ pub fn spawn_lifecycle(
             } else {
                 0.0
             };
-            highest = highest.max(ratio);
+            if ratio > highest {
+                highest = ratio;
+                last_high_age = age;
+            }
             lowest = lowest.min(ratio);
             let max_favorable_pct = (highest - 1.0) * 100.0;
             let current_pnl_pct = (ratio - 1.0) * 100.0;
@@ -169,6 +211,7 @@ pub fn spawn_lifecycle(
                     simulated_sells + 1,
                     highest,
                     lowest,
+                    age.saturating_sub(last_high_age),
                 )
                 .await;
                 return;
@@ -188,6 +231,7 @@ pub fn spawn_lifecycle(
                     simulated_sells + 1,
                     highest,
                     lowest,
+                    age.saturating_sub(last_high_age),
                 )
                 .await;
                 return;
@@ -207,6 +251,7 @@ pub fn spawn_lifecycle(
                     simulated_sells + 1,
                     highest,
                     lowest,
+                    age.saturating_sub(last_high_age),
                 )
                 .await;
                 return;
@@ -227,6 +272,7 @@ pub fn spawn_lifecycle(
                     simulated_sells + 1,
                     highest,
                     lowest,
+                    age.saturating_sub(last_high_age),
                 )
                 .await;
                 return;
@@ -243,6 +289,7 @@ pub fn spawn_lifecycle(
                     simulated_sells + 1,
                     highest,
                     lowest,
+                    age.saturating_sub(last_high_age),
                 )
                 .await;
                 return;
@@ -267,6 +314,7 @@ pub fn spawn_lifecycle(
                     simulated_sells + 1,
                     highest,
                     lowest,
+                    age.saturating_sub(last_high_age),
                 )
                 .await;
                 return;
@@ -283,6 +331,7 @@ pub fn spawn_lifecycle(
                     simulated_sells + 1,
                     highest,
                     lowest,
+                    age.saturating_sub(last_high_age),
                 )
                 .await;
                 return;
@@ -302,6 +351,7 @@ pub fn spawn_lifecycle(
                     simulated_sells + 1,
                     highest,
                     lowest,
+                    age.saturating_sub(last_high_age),
                 )
                 .await;
                 return;
@@ -318,6 +368,7 @@ pub fn spawn_lifecycle(
                     simulated_sells + 1,
                     highest,
                     lowest,
+                    age.saturating_sub(last_high_age),
                 )
                 .await;
                 return;
@@ -367,6 +418,7 @@ async fn finalize(
     simulated_sells: u64,
     highest: f64,
     lowest: f64,
+    secs_since_high: u64,
 ) {
     if let Ok(reserve) = quote_reserve_raw(rpc, target).await {
         state.quote_reserve_raw = reserve;
@@ -382,10 +434,11 @@ async fn finalize(
     let gross = exit_sol - state.paper_entry_sol;
     let costs = estimate_costs_sol(simulated_sells);
     let net = gross - costs;
-    if !net.is_finite()
+    let invalid_quote = !net.is_finite()
         || state.paper_entry_sol <= 0.0
-        || (exit_sol > state.paper_entry_sol * 100.0)
-    {
+        || exit_sol <= 0.0
+        || (exit_sol > state.paper_entry_sol * 100.0);
+    if invalid_quote {
         state.excluded_from_stats = true;
         state.exit_reason = "invalid_quote".into();
     } else {
@@ -409,8 +462,139 @@ async fn finalize(
     state.hold_secs = age;
     state.max_drawdown_pct = (lowest - 1.0) * 100.0;
     state.max_favorable_pct = (highest - 1.0) * 100.0;
+    apply_paper_quote_validation_metadata(state, invalid_quote, reason, exit_sol);
+    if let Some(shadow_reason) = z3_exit_v3_paper_shadow_reason(
+        &state.variant_id,
+        age,
+        exit_sol,
+        state.paper_entry_sol,
+        state.max_favorable_pct,
+        secs_since_high,
+    ) {
+        println!(
+            "🧪 Z3_EXIT_V3_PAPER_SHADOW would_exit={} mint={} paper_exit_reason={} age_secs={} current_pnl_pct={:.3} max_favorable_pct={:.3} secs_since_high={} paper_exit_sol={:.9} paper_entry_sol={:.9} live_decision=NO_ACTION_LOG_ONLY",
+            shadow_reason,
+            state.mint,
+            state.exit_reason,
+            age,
+            paper_current_pnl_pct(exit_sol, state.paper_entry_sol),
+            state.max_favorable_pct,
+            secs_since_high,
+            exit_sol,
+            state.paper_entry_sol,
+        );
+    }
     state.remaining_tokens = 0;
     let _ = ledger.save_new_position(state);
+}
+
+fn apply_paper_quote_validation_metadata(
+    state: &mut PositionState,
+    invalid_quote: bool,
+    requested_reason: &str,
+    exit_sol: f64,
+) {
+    let pnl = state.net_pnl_pct;
+    let mfe = state.max_favorable_pct;
+    let dd = state.max_drawdown_pct;
+    let mut codes = state.quote_reason_codes.clone();
+
+    let absurd_pnl = pnl.abs() > 500.0;
+    let absurd_mfe = mfe.abs() > 500.0;
+    let hard_absurd = pnl.abs() > 1000.0 || mfe.abs() > 1000.0;
+    let dd_artifact = dd <= -95.0 && (pnl > -20.0 || mfe >= 25.0 || requested_reason == "breakeven_floor");
+    let impossible_price_jump = state.paper_entry_sol > 0.0 && exit_sol > state.paper_entry_sol * 100.0;
+    let quote_artifact = dd_artifact || hard_absurd || impossible_price_jump;
+    let quote_unavailable = requested_reason == "price_unavailable" || state.quote_unavailable;
+    let quote_stale = quote_unavailable && state.last_valid_quote_age_secs > 30;
+
+    push_code(&mut codes, "quote_source_build_sell_amm_ixs");
+    if invalid_quote {
+        push_code(&mut codes, "invalid_quote_guard");
+    }
+    if exit_sol <= 0.0 || !exit_sol.is_finite() {
+        push_code(&mut codes, "invalid_exit_value");
+    }
+    if state.paper_entry_sol <= 0.0 {
+        push_code(&mut codes, "invalid_entry_value");
+    }
+    if absurd_pnl {
+        push_code(&mut codes, "absurd_pnl");
+    }
+    if absurd_mfe {
+        push_code(&mut codes, "absurd_mfe");
+    }
+    if impossible_price_jump {
+        push_code(&mut codes, "impossible_price_jump");
+    }
+    if dd_artifact {
+        push_code(&mut codes, "dd_artifact");
+    }
+    if quote_stale {
+        push_code(&mut codes, "stale_quote");
+    }
+
+    state.quote_source = if state.quote_source.is_empty() {
+        "build_sell_amm_ixs".into()
+    } else {
+        state.quote_source.clone()
+    };
+    state.last_valid_value_sol = if state.last_valid_value_sol > 0.0 {
+        state.last_valid_value_sol
+    } else {
+        exit_sol.max(0.0)
+    };
+    state.last_valid_quote_sol = if state.last_valid_quote_sol > 0.0 {
+        state.last_valid_quote_sol
+    } else {
+        exit_sol.max(0.0)
+    };
+    state.quote_unavailable = quote_unavailable;
+    state.quote_stale = quote_stale;
+    state.quote_invalid = invalid_quote || absurd_pnl || absurd_mfe || impossible_price_jump;
+    state.quote_artifact = quote_artifact;
+    state.valuation_uncertain = state.valuation_uncertain || quote_unavailable || state.quote_invalid || quote_artifact;
+    state.exit_affected = state.exit_affected || requested_reason == "price_unavailable";
+    state.quote_valid = !state.quote_unavailable && !state.quote_invalid && !state.quote_artifact;
+    state.metrics_eligible = !state.quote_invalid && !state.quote_artifact;
+    state.exit_design_eligible = state.metrics_eligible
+        && !state.quote_unavailable
+        && !state.valuation_uncertain
+        && !matches!(requested_reason, "hard_stop" | "price_unavailable" | "invalid_quote");
+    state.quote_reason_codes = codes;
+}
+
+fn push_code(codes: &mut Vec<String>, code: &str) {
+    if !codes.iter().any(|existing| existing == code) {
+        codes.push(code.to_string());
+    }
+}
+
+fn z3_exit_v3_paper_shadow_reason(
+    variant_id: &str,
+    age_secs: u64,
+    exit_sol: f64,
+    entry_sol: f64,
+    max_favorable_pct: f64,
+    secs_since_high: u64,
+) -> Option<&'static str> {
+    if variant_id != "Z3" || entry_sol <= 0.0 || !exit_sol.is_finite() {
+        return None;
+    }
+    z3_exit_v3_shadow_reason(
+        age_secs,
+        exit_sol / entry_sol,
+        max_favorable_pct,
+        secs_since_high,
+    )
+}
+
+fn paper_current_pnl_pct(exit_sol: f64, entry_sol: f64) -> f64 {
+    if entry_sol > 0.0 && exit_sol.is_finite() {
+        (exit_sol / entry_sol - 1.0) * 100.0
+    } else {
+        0.0
+    }
 }
 
 #[cfg(test)]
@@ -441,5 +625,27 @@ mod tests {
             150.0,
             90.0
         ));
+    }
+
+    #[test]
+    fn z3_exit_v3_paper_shadow_is_log_only_for_z3() {
+        let current_policy_reason = "max_hold";
+        assert_eq!(
+            z3_exit_v3_paper_shadow_reason("Z3", 180, 1.029, 1.0, 15.0, 20),
+            Some("would_exit_profit_lock_v3")
+        );
+        assert_eq!(current_policy_reason, "max_hold");
+    }
+
+    #[test]
+    fn z3_exit_v3_paper_shadow_ignores_non_z3_and_bad_entry() {
+        assert_eq!(
+            z3_exit_v3_paper_shadow_reason("Z", 180, 1.029, 1.0, 15.0, 20),
+            None
+        );
+        assert_eq!(
+            z3_exit_v3_paper_shadow_reason("Z3", 180, 1.029, 0.0, 15.0, 20),
+            None
+        );
     }
 }

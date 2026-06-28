@@ -130,6 +130,42 @@ pub struct PositionState {
     #[serde(default)]
     pub last_valid_quote_sol: f64,
     #[serde(default)]
+    pub quote_valid: bool,
+    #[serde(default)]
+    pub quote_unavailable: bool,
+    #[serde(default)]
+    pub quote_stale: bool,
+    #[serde(default)]
+    pub quote_invalid: bool,
+    #[serde(default)]
+    pub quote_artifact: bool,
+    #[serde(default)]
+    pub valuation_uncertain: bool,
+    #[serde(default)]
+    pub exit_affected: bool,
+    #[serde(default)]
+    pub metrics_eligible: bool,
+    #[serde(default)]
+    pub exit_design_eligible: bool,
+    #[serde(default)]
+    pub quote_reason_codes: Vec<String>,
+    #[serde(default)]
+    pub last_valid_value_sol: f64,
+    #[serde(default)]
+    pub last_valid_quote_age_secs: u64,
+    #[serde(default)]
+    pub quote_error_count: u64,
+    #[serde(default)]
+    pub quote_retry_count: u64,
+    #[serde(default)]
+    pub quote_failure_stage: String,
+    #[serde(default)]
+    pub quote_source: String,
+    #[serde(default)]
+    pub fallback_used: bool,
+    #[serde(default)]
+    pub fallback_reason: String,
+    #[serde(default)]
     pub sell_signature: String,
     #[serde(default)]
     pub live_exit_sol: f64,

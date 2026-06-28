@@ -1,0 +1,26 @@
+{
+  "exit_affected_count": 257,
+  "exit_design_eligible_count": 5851,
+  "exit_design_eligible_metrics": {
+    "avg_pnl_pct": 22.305465,
+    "count": 5851,
+    "median_pnl_pct": 12.8919,
+    "wr": "4417/5851"
+  },
+  "metrics_eligible_count": 6944,
+  "metrics_eligible_metrics": {
+    "avg_pnl_pct": 14.528811,
+    "count": 6944,
+    "median_pnl_pct": 8.500133,
+    "wr": "4815/6944"
+  },
+  "native_validator_rows_seen": 0,
+  "price_unavailable_exit_affected_count": 257,
+  "price_unavailable_profitable_count": 398,
+  "quote_artifact_count": 149,
+  "quote_invalid_count": 93,
+  "quote_unavailable_count": 655,
+  "quote_valid_count": 6289,
+  "total_completed": 7186,
+  "valuation_uncertain_count": 897
+}
